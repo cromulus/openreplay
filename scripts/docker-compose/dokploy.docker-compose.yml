@@ -184,13 +184,18 @@ services:
     networks:
       - openreplay-net
     volumes:
-      - ../schema/db/init_dbs/postgresql/init_schema.sql:/tmp/init_schema.sql
+      - ../schema:/opt/openreplay/openreplay/scripts/schema:ro
+      - ../helmcharts/openreplay/files/postgresql.sh:/tmp/postgresql.sh:ro
+      - ./dokploy-migrate.sh:/tmp/dokploy-migrate.sh:ro
     environment:
       PGHOST: postgresql
       PGPORT: 5432
       PGDATABASE: postgres
       PGUSER: postgres
       PGPASSWORD: ${COMMON_PG_PASSWORD}
+      COMMON_VERSION: "${COMMON_VERSION:-v1.27.0}"
+      OPENREPLAY_FROM_VERSION: "${OPENREPLAY_FROM_VERSION:-}"
+      OPENREPLAY_TO_VERSION: "${OPENREPLAY_TO_VERSION:-v1.27.0}"
     entrypoint:
       - /bin/bash
       - -c
@@ -200,7 +205,7 @@ services:
           sleep 1
           done
           echo "PostgreSQL is up - executing command"
-          psql -v ON_ERROR_STOP=1 -f /tmp/init_schema.sql
+          bash /tmp/dokploy-migrate.sh postgresql
 
   clickhouse-migration:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
@@ -211,26 +216,31 @@ services:
     networks:
       - openreplay-net
     volumes:
-      - ../schema/db/init_dbs/clickhouse/create/init_schema.sql:/tmp/init_schema.sql
+      - ../schema:/opt/openreplay/openreplay/scripts/schema:ro
+      - ../helmcharts/openreplay/files/clickhouse.sh:/tmp/clickhouse.sh:ro
+      - ./dokploy-migrate.sh:/tmp/dokploy-migrate.sh:ro
     environment:
       CH_HOST: "clickhouse-openreplay-clickhouse.db.svc.cluster.local"
       CH_PORT: "9000"
       CH_PORT_HTTP: "8123"
       CH_USERNAME: "default"
       CH_PASSWORD: ""
+      COMMON_VERSION: "${COMMON_VERSION:-v1.27.0}"
+      OPENREPLAY_FROM_VERSION: "${OPENREPLAY_FROM_VERSION:-}"
+      OPENREPLAY_TO_VERSION: "${OPENREPLAY_TO_VERSION:-v1.27.0}"
     entrypoint:
       - /bin/bash
       - -c
       - |
           # Checking variable is empty. Shell independant method.
-          # Wait for Minio to be ready
+          # Wait for ClickHouse to be ready
           until nc -z -v -w30 clickhouse-openreplay-clickhouse.db.svc.cluster.local 9000; do
-              echo "Waiting for Minio server to be ready..."
+              echo "Waiting for ClickHouse server to be ready..."
               sleep 1
           done
 
           echo "clickhouse is up - executing command"
-          clickhouse-client -h clickhouse-openreplay-clickhouse.db.svc.cluster.local --user default --port 9000 --multiquery < /tmp/init_schema.sql || true
+          bash /tmp/dokploy-migrate.sh clickhouse
   
   alerts-openreplay:
     image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/alerts:${COMMON_VERSION:-v1.27.0}
