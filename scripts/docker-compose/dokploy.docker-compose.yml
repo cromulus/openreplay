@@ -1,4 +1,12 @@
 # vim: ft=yaml
+x-openreplay-app-depends-on: &openreplay-app-depends-on
+  db-migration:
+    condition: service_completed_successfully
+  clickhouse-migration:
+    condition: service_completed_successfully
+  kafka-migration:
+    condition: service_completed_successfully
+
 services:
 
   postgresql:
@@ -106,8 +114,6 @@ services:
   kafka-migration:
     image: ghcr.io/openreplay/kafka:${KAFKA_VERSION}
     container_name: kafka-migration
-    profiles:
-      - "migration"
     depends_on:
       - kafka
     networks:
@@ -132,8 +138,6 @@ services:
   fs-permission:
     image: debian:stable-slim
     container_name: fs-permission
-    profiles:
-      - "migration"
     volumes:
       - shared-volume:/mnt/efs
       - miniodata:/mnt/minio
@@ -148,8 +152,6 @@ services:
   minio-migration:
     image: minio/mc:latest
     container_name: minio-migration
-    profiles:
-      - "migration"
     depends_on:
       - minio
       - fs-permission
@@ -176,8 +178,6 @@ services:
   db-migration:
     image: ghcr.io/openreplay/postgres:${POSTGRES_VERSION}
     container_name: db-migration
-    profiles:
-      - "migration"
     depends_on:
       - postgresql
       - minio-migration
@@ -205,8 +205,6 @@ services:
   clickhouse-migration:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
     container_name: clickhouse-migration
-    profiles:
-      - "migration"
     depends_on:
       - clickhouse
       - minio-migration
@@ -235,7 +233,7 @@ services:
           clickhouse-client -h clickhouse-openreplay-clickhouse.db.svc.cluster.local --user default --port 9000 --multiquery < /tmp/init_schema.sql || true
   
   alerts-openreplay:
-    image: public.ecr.aws/p1t3u8a3/alerts:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/alerts:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: alerts
     networks:
@@ -248,11 +246,12 @@ services:
     env_file:
       - docker-envs/alerts.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   api-openreplay:
-    image: public.ecr.aws/p1t3u8a3/api:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/api:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: api
     networks:
@@ -265,11 +264,12 @@ services:
     env_file:
       - docker-envs/api.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   http-openreplay:
-    image: public.ecr.aws/p1t3u8a3/http:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/http:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: http
     networks:
@@ -282,11 +282,12 @@ services:
     env_file:
       - docker-envs/http.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   images-openreplay:
-    image: public.ecr.aws/p1t3u8a3/images:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/images:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: images
     networks:
@@ -299,11 +300,12 @@ services:
     env_file:
       - docker-envs/images.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   integrations-openreplay:
-    image: public.ecr.aws/p1t3u8a3/integrations:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/integrations:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: integrations
     networks:
@@ -316,11 +318,12 @@ services:
     env_file:
       - docker-envs/integrations.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   sink-openreplay:
-    image: public.ecr.aws/p1t3u8a3/sink:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/sink:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: sink
     networks:
@@ -333,11 +336,12 @@ services:
     env_file:
       - docker-envs/sink.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   sourcemapreader-openreplay:
-    image: public.ecr.aws/p1t3u8a3/sourcemapreader:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/sourcemapreader:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: sourcemapreader
     networks:
@@ -350,11 +354,12 @@ services:
     env_file:
       - docker-envs/sourcemapreader.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   spot-openreplay:
-    image: public.ecr.aws/p1t3u8a3/spot:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/spot:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: spot
     networks:
@@ -367,11 +372,12 @@ services:
     env_file:
       - docker-envs/spot.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   storage-openreplay:
-    image: public.ecr.aws/p1t3u8a3/storage:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/storage:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: storage
     networks:
@@ -384,11 +390,12 @@ services:
     env_file:
       - docker-envs/storage.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   assets-openreplay:
-    image: public.ecr.aws/p1t3u8a3/assets:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/assets:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: assets
     networks:
@@ -401,11 +408,12 @@ services:
     env_file:
       - docker-envs/assets.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   assist-openreplay:
-    image: public.ecr.aws/p1t3u8a3/assist:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/assist:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: assist
     networks:
@@ -418,11 +426,12 @@ services:
     env_file:
       - docker-envs/assist.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   canvases-openreplay:
-    image: public.ecr.aws/p1t3u8a3/canvases:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/canvases:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: canvases
     networks:
@@ -435,11 +444,12 @@ services:
     env_file:
       - docker-envs/canvases.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   chalice-openreplay:
-    image: public.ecr.aws/p1t3u8a3/chalice:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/chalice:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: chalice
     networks:
@@ -451,12 +461,35 @@ services:
       - shared-volume:/mnt/efs
     env_file:
       - docker-envs/chalice.env
-    environment: {}  # Fallback empty environment if env_file is missing
+    environment:
+      ENABLE_SSO: "${ENABLE_SSO:-true}"
+      SAML2_MD_URL: "${SAML2_MD_URL:-}"
+      idp_entityId: "${idp_entityId:-}"
+      idp_sso_url: "${idp_sso_url:-}"
+      idp_x509cert: "${idp_x509cert:-}"
+      idp_sls_url: "${idp_sls_url:-}"
+      idp_name: "${idp_name:-}"
+      idp_tenantKey: "${idp_tenantKey:-}"
+      enforce_SSO: "${enforce_SSO:-false}"
+      sp_crt: "${sp_crt:-}"
+      sp_key: "${sp_key:-}"
+      saml_strict: "${saml_strict:-true}"
+      saml_debug: "${saml_debug:-false}"
+      EMAIL_HOST: "${EMAIL_HOST:-}"
+      EMAIL_PORT: "${EMAIL_PORT:-587}"
+      EMAIL_USER: "${EMAIL_USER:-}"
+      EMAIL_PASSWORD: "${EMAIL_PASSWORD:-}"
+      EMAIL_USE_TLS: "${EMAIL_USE_TLS:-true}"
+      EMAIL_USE_SSL: "${EMAIL_USE_SSL:-false}"
+      EMAIL_SSL_KEY: "${EMAIL_SSL_KEY:-}"
+      EMAIL_SSL_CERT: "${EMAIL_SSL_CERT:-}"
+      EMAIL_FROM: "${EMAIL_FROM:-OpenReplay<do-not-reply@openreplay.com>}"
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   db-openreplay:
-    image: public.ecr.aws/p1t3u8a3/db:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/db:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: db
     networks:
@@ -469,11 +502,12 @@ services:
     env_file:
       - docker-envs/db.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   ender-openreplay:
-    image: public.ecr.aws/p1t3u8a3/ender:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/ender:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: ender
     networks:
@@ -486,11 +520,12 @@ services:
     env_file:
       - docker-envs/ender.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   frontend-openreplay:
-    image: public.ecr.aws/p1t3u8a3/frontend:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/frontend:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: frontend
     networks:
@@ -503,11 +538,12 @@ services:
     env_file:
       - docker-envs/frontend.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
   
   heuristics-openreplay:
-    image: public.ecr.aws/p1t3u8a3/heuristics:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY}/heuristics:${COMMON_VERSION}
     domainname: app.svc.cluster.local
     container_name: heuristics
     networks:
@@ -520,6 +556,7 @@ services:
     env_file:
       - docker-envs/heuristics.env
     environment: {}  # Fallback empty environment if env_file is missing
+    depends_on: *openreplay-app-depends-on
     restart: unless-stopped
   
 
