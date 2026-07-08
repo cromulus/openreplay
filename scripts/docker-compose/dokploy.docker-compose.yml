@@ -233,7 +233,7 @@ services:
           clickhouse-client -h clickhouse-openreplay-clickhouse.db.svc.cluster.local --user default --port 9000 --multiquery < /tmp/init_schema.sql || true
   
   alerts-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/alerts:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/alerts:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: alerts
     networks:
@@ -251,7 +251,7 @@ services:
   
   
   api-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/api:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/api:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: api
     networks:
@@ -269,7 +269,7 @@ services:
   
   
   http-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/http:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/http:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: http
     networks:
@@ -287,7 +287,7 @@ services:
   
   
   images-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/images:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/images:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: images
     networks:
@@ -305,7 +305,7 @@ services:
   
   
   integrations-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/integrations:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/integrations:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: integrations
     networks:
@@ -323,7 +323,7 @@ services:
   
   
   sink-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/sink:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/sink:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: sink
     networks:
@@ -341,7 +341,7 @@ services:
   
   
   sourcemapreader-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/sourcemapreader:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/sourcemapreader:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: sourcemapreader
     networks:
@@ -359,7 +359,7 @@ services:
   
   
   spot-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/spot:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/spot:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: spot
     networks:
@@ -377,7 +377,7 @@ services:
   
   
   storage-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/storage:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/storage:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: storage
     networks:
@@ -395,7 +395,7 @@ services:
   
   
   assets-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/assets:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/assets:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: assets
     networks:
@@ -413,7 +413,7 @@ services:
   
   
   assist-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/assist:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/assist:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: assist
     networks:
@@ -431,7 +431,7 @@ services:
   
   
   canvases-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/canvases:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/canvases:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: canvases
     networks:
@@ -449,7 +449,7 @@ services:
   
   
   chalice-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/chalice:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/chalice:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: chalice
     networks:
@@ -489,7 +489,7 @@ services:
   
   
   db-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/db:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/db:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: db
     networks:
@@ -507,7 +507,7 @@ services:
   
   
   ender-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/ender:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/ender:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: ender
     networks:
@@ -525,7 +525,7 @@ services:
   
   
   frontend-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/frontend:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/frontend:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: frontend
     networks:
@@ -543,7 +543,7 @@ services:
   
   
   heuristics-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/heuristics:${COMMON_VERSION}
+    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/heuristics:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
     container_name: heuristics
     networks:

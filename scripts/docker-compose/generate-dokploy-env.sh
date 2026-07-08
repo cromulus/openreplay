@@ -65,7 +65,7 @@ if [[ -z "$domain" ]]; then
 fi
 
 env_block="$(cat <<EOF
-COMMON_VERSION=v1.23.0
+COMMON_VERSION=v1.27.0
 COMMON_APP_IMAGE_REGISTRY=public.ecr.aws/p1t3u8a3
 COMMON_PROTOCOL=${protocol}
 COMMON_DOMAIN_NAME=${domain}

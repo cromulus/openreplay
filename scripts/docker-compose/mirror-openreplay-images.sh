@@ -8,8 +8,8 @@ Usage:
   mirror-openreplay-images.sh <target-registry> [tag]
 
 Examples:
-  ./mirror-openreplay-images.sh ghcr.io/my-org/openreplay v1.23.0
-  ./mirror-openreplay-images.sh registry.example.com/openreplay v1.23.0
+  ./mirror-openreplay-images.sh ghcr.io/my-org/openreplay v1.27.0
+  ./mirror-openreplay-images.sh registry.example.com/openreplay v1.27.0
 
 Set SOURCE_REGISTRY to override the upstream source registry.
 Default source: public.ecr.aws/p1t3u8a3
@@ -52,7 +52,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 target_registry="${1:-}"
-tag="${2:-v1.23.0}"
+tag="${2:-v1.27.0}"
 source_registry="${SOURCE_REGISTRY:-public.ecr.aws/p1t3u8a3}"
 platform="${PLATFORM:-linux/amd64}"
 
