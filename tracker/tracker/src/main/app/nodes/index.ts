@@ -1,6 +1,6 @@
 import { createEventListener, deleteEventListener } from '../../utils.js'
 import Maintainer, { MaintainerOptions } from './maintainer.js'
-import { pack } from './idSeq.js'
+import { pack, MASK_NODE } from './idSeq.js'
 
 type NodeCallback = (node: Node, isStart: boolean) => void
 type ElementListener = [string, EventListener, boolean]
@@ -9,6 +9,8 @@ export interface NodesOptions {
   node_id: string
   forceNgOff: boolean
   maintainer?: Partial<MaintainerOptions>
+  /** called once when a crossdomain frame runs out of its node id block */
+  onIdSpaceExhausted?: () => void
 }
 
 export default class Nodes {
@@ -20,17 +22,25 @@ export default class Nodes {
   private readonly node_id: string
   private readonly forceNgOff: boolean
   private readonly maintainer: Maintainer
+  private maintainerRunning = false
+  // last id of this frame's packed block; ids past it would land in another frame's block
+  private idLimit = Infinity
+  private idSpaceExhausted = false
+  private readonly onIdSpaceExhausted?: () => void
 
   constructor(params: NodesOptions) {
     this.node_id = params.node_id
     this.forceNgOff = params.forceNgOff
     this.maintainer = new Maintainer(this.nodes, this.unregisterNode, params.maintainer)
-    this.maintainer.start()
+    this.onIdSpaceExhausted = params.onIdSpaceExhausted
   }
 
   crossdomainMode(level: number, frameOrder: number) {
     this.nextNodeId = this.createFrameId(level, frameOrder)
+    this.idLimit = this.nextNodeId + MASK_NODE
+    this.idSpaceExhausted = false
   }
+
 
   // Attached once per Tracker instance
   attachNodeCallback = (nodeCallback: NodeCallback): number => {
@@ -65,10 +75,19 @@ export default class Nodes {
   }
 
   registerNode(node: Node): [/*id:*/ number, /*isNew:*/ boolean] {
-    let id: number = (node as any)[this.node_id]
-    const isNew = id === undefined
+    const existing: number | undefined = (node as any)[this.node_id]
+    const isNew = existing === undefined || this.nodes.get(existing) !== node
+    let id: number = existing as number
     if (isNew) {
+      if (!this.maintainerRunning) {
+        this.maintainerRunning = true
+        this.maintainer.start()
+      }
       id = this.nextNodeId
+      if (id > this.idLimit && !this.idSpaceExhausted) {
+        this.idSpaceExhausted = true
+        this.onIdSpaceExhausted?.()
+      }
       this.totalNodeAmount++
       this.nextNodeId++
       this.nodes.set(id, node)
@@ -116,6 +135,12 @@ export default class Nodes {
     return (node as any)[this.node_id]
   }
 
+  isBound(node: Node): boolean {
+    if (!node) return false
+    const id = (node as any)[this.node_id]
+    return id !== undefined && this.nodes.get(id) === node
+  }
+
   getNode(id: number) {
     return this.nodes.get(id)
   }
@@ -125,6 +150,8 @@ export default class Nodes {
   }
 
   clear(): void {
+    this.maintainer.stop()
+    this.maintainerRunning = false
     for (const [_, node] of this.nodes) {
       if (node) {
         this.unregisterNode(node)
@@ -132,6 +159,8 @@ export default class Nodes {
     }
 
     this.nextNodeId = 0
+    this.idLimit = Infinity
+    this.idSpaceExhausted = false
     this.nodes.clear()
   }
 }

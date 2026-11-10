@@ -1,5 +1,5 @@
 import { PlusOutlined } from '@ant-design/icons';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import withPermissions from 'HOCs/withPermissions';
 import { Button, Input } from 'antd';
 import { Album } from 'lucide-react';
@@ -7,13 +7,15 @@ import { observer } from 'mobx-react-lite';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 
+import type { SavedSegment } from 'App/components/SmartAlerts/api';
+import SegmentDrawer from 'App/components/SmartAlerts/segments/SegmentDrawer';
 import { useStore } from 'App/mstore';
 import { dataManagement, withSiteId } from 'App/routes';
 import { useHistory } from 'App/routing';
 import { debounce } from 'App/utils';
 
 import SegmentsList from './SegmentsList';
-import { fetchSegments } from './api';
+import { selectSegments } from './api';
 
 type SortBy = 'name' | 'createdAt' | 'updatedAt';
 type SortOrder = 'asc' | 'desc';
@@ -22,14 +24,24 @@ function SegmentsListPage() {
   const { t } = useTranslation();
   const [query, setQuery] = React.useState('');
   const [debouncedQuery, setDebouncedQuery] = React.useState('');
-  const { projectsStore } = useStore();
+  const { projectsStore, issuesStore, searchStore } = useStore();
   const siteId = projectsStore.activeSiteId;
   const history = useHistory();
+  const queryClient = useQueryClient();
+
+  const [drawerOpen, setDrawerOpen] = React.useState(false);
+  const [editing, setEditing] = React.useState<SavedSegment | null>(null);
 
   const limit = 10;
   const [page, setPage] = React.useState(1);
   const [sortBy, setSortBy] = React.useState<SortBy>('updatedAt');
   const [sortOrder, setSortOrder] = React.useState<SortOrder>('desc');
+
+  // load the capture layer so the list's Issues Agent column + creator meta
+  // (both sourced from issuesStore.segmentById) are populated
+  React.useEffect(() => {
+    if (siteId) issuesStore.ensureSegments(String(siteId));
+  }, [siteId]);
 
   const applySearch = React.useMemo(
     () =>
@@ -55,14 +67,19 @@ function SegmentsListPage() {
       sortBy,
       sortOrder,
     ],
-    queryFn: () =>
-      fetchSegments({
+    // searchStore holds the app's single saved-search fetch; this only slices it
+    queryFn: async () => {
+      // the list renders # Sessions / # Users, which the server only returns
+      // when asked
+      await searchStore.ensureSavedSearchList(true);
+      return selectSegments(searchStore.savedSearchRaw, {
         limit,
         page,
         name: debouncedQuery || undefined,
         sortBy,
         sortOrder,
-      }),
+      });
+    },
   });
 
   const onPageChange = (newPage: number) => {
@@ -74,12 +91,26 @@ function SegmentsListPage() {
     setPage(1);
   };
 
+  const onSaved = () => {
+    queryClient.invalidateQueries({ queryKey: ['segments-list'] });
+  };
+
+  // create/edit happens in the shared slide-out (the same one Issues uses); the
+  // full-page editor stays routed as a fallback when a row isn't in the loaded
+  // capture set (e.g. beyond the fetch window)
   const toSegment = (id: string) => {
+    const segment = issuesStore.segmentById(id);
+    if (segment) {
+      setEditing(segment);
+      setDrawerOpen(true);
+      return;
+    }
     history.push(withSiteId(dataManagement.segmentPage(id), siteId!));
   };
 
   const toCreate = () => {
-    history.push(withSiteId(dataManagement.segmentPage('new'), siteId!));
+    setEditing(null);
+    setDrawerOpen(true);
   };
 
   return (
@@ -87,7 +118,11 @@ function SegmentsListPage() {
       className="flex flex-col rounded-lg border bg-white mx-auto"
       style={{ maxWidth: 1360 }}
     >
-      <div className={'flex flex-col gap-2 md:gap-0 md:flex-row md:items-center md:justify-between border-b px-4 py-2'}>
+      <div
+        className={
+          'flex flex-col gap-2 md:gap-0 md:flex-row md:items-center md:justify-between border-b px-4 py-2'
+        }
+      >
         <div className="flex items-center gap-2">
           <div className={'font-semibold text-lg capitalize'}>
             {t('Segments')}
@@ -123,6 +158,7 @@ function SegmentsListPage() {
           </div>
         </div>
       </div>
+
       <SegmentsList
         list={data.segments}
         page={page}
@@ -134,6 +170,14 @@ function SegmentsListPage() {
         onSortChange={onSortChange}
         toSegment={toSegment}
         toCreate={toCreate}
+      />
+
+      <SegmentDrawer
+        open={drawerOpen}
+        segment={editing}
+        source="dm"
+        onClose={() => setDrawerOpen(false)}
+        onSaved={onSaved}
       />
     </div>
   );

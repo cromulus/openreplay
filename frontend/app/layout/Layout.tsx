@@ -2,6 +2,9 @@ import { Layout as AntLayout } from 'antd';
 import { observer } from 'mobx-react-lite';
 import React, { useEffect } from 'react';
 
+import { INDEXES } from 'App/constants/zindex';
+
+import HeaderBanners from 'App/layout/HeaderBanners';
 import SideMenu from 'App/layout/SideMenu';
 import TopHeader from 'App/layout/TopHeader';
 import { useStore } from 'App/mstore';
@@ -19,9 +22,8 @@ function Layout(props: Props) {
   const isPlayer = /\/(session|assist|view-spot)\//.test(
     window.location.pathname,
   );
-  const { settingsStore, projectsStore } = useStore();
+  const { settingsStore } = useStore();
   const [collapsed, setCollapsed] = React.useState(false);
-  const { siteId } = projectsStore;
   const mobileDevice = mobileScreen;
 
   useEffect(() => {
@@ -41,47 +43,65 @@ function Layout(props: Props) {
     };
   }, []);
 
+  // onboarding keeps the sider and swaps only the menu body inside it (SideMenu)
+  const showMenu = !hideHeader;
+  // the sider carries the logo, except on mobile where it collapses into a
+  // drawer — there the header takes it over
+  const logoInHeader = mobileDevice;
+
   return (
     <AntLayout style={{ height: mobileDevice ? '100dvh' : undefined }}>
-      <div className={hideHeader ? 'hidden' : 'block'}>
-        <TopHeader />
-      </div>
+      {hideHeader ? null : <HeaderBanners />}
+      {/* sider is its own column so the logo/collapse row at its top stays
+          pinned together with the menu instead of with the scrolling header */}
       <AntLayout>
-        {!hideHeader && !window.location.pathname.includes('/onboarding/') ? (
+        {showMenu ? (
           mobileDevice ? (
             <SideMenu
-              siteId={siteId!}
               isCollapsed={settingsStore.menuCollapsed || collapsed}
             />
           ) : (
             <Sider
               style={{
                 position: 'sticky',
-                top: 60,
+                top: 0,
                 alignSelf: 'flex-start',
               }}
               collapsed={settingsStore.menuCollapsed || collapsed}
               width={250}
             >
               <SideMenu
-                siteId={siteId!}
                 isCollapsed={settingsStore.menuCollapsed || collapsed}
               />
             </Sider>
           )
         ) : null}
-        <Content
-          style={{
-            padding: isPlayer
-              ? '0'
-              : mobileDevice
-                ? '8px 8px 60px 8px'
-                : '20px',
-            minHeight: 'calc(100dvh - 60px)',
-          }}
-        >
-          {props.children}
-        </Content>
+        {/* hasSider is pinned: a Sider registers with the nearest Layout through
+            context, so a page rendering its own Sider inside Content (onboarding)
+            would otherwise flip this column to a row and put the header beside it */}
+        <AntLayout hasSider={false}>
+          {/* sticky lives on the wrapper, not on antd's Header: a sticky box
+              cannot travel outside its own parent, so a 60px-tall wrapper
+              would leave it no room to stick at all */}
+          <div
+            className={hideHeader ? 'hidden' : 'block'}
+            style={{ position: 'sticky', top: 0, zIndex: INDEXES.HEADER }}
+          >
+            <TopHeader showLogo={logoInHeader} />
+          </div>
+          <Content
+            style={{
+              padding: isPlayer
+                ? '0'
+                : mobileDevice
+                  ? '8px 8px 60px 8px'
+                  : '20px',
+              minHeight: 'calc(100dvh - 60px)',
+            }}
+          >
+            {props.children}
+          </Content>
+        </AntLayout>
       </AntLayout>
     </AntLayout>
   );

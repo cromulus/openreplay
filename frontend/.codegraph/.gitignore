@@ -1,0 +1,3 @@
+# CodeGraph data is local to each machine: ignore everything but this file.
+*
+!.gitignore

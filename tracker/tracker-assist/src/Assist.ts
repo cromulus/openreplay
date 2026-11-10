@@ -10,12 +10,52 @@ import RemoteControl, { RCStatus } from "./RemoteControl.js";
 import CallWindow from "./CallWindow.js";
 import AnnotationCanvas from "./AnnotationCanvas.js";
 import ConfirmWindow from "./ConfirmWindow/ConfirmWindow.js";
-import { callConfirmDefault } from "./ConfirmWindow/defaults.js";
+import {
+  callConfirmDefault,
+  sessionConfirmDefault,
+} from "./ConfirmWindow/defaults.js";
 import type { Options as ConfirmOptions } from "./ConfirmWindow/defaults.js";
 import ScreenRecordingState from "./ScreenRecordingState.js";
 import { pkgVersion } from "./version.js";
 import Canvas from "./Canvas.js";
 import { gzip } from "fflate";
+
+const textEncoder = new TextEncoder();
+
+// sessionStorage flag used by Autostart.Continuation to survive page reloads
+const SS_CONTINUE_KEY = "__openreplay_assist_continue";
+// sessionStorage flag: user already approved session viewing (requestConfirm
+// mode), so a page reload doesn't re-prompt
+const SS_CONFIRM_KEY = "__openreplay_session_confirm";
+
+/**
+ * Events allowed out of the socket before the user approved session viewing.
+ * They carry no replay or media payload: session metadata (live-session list,
+ * tab activity, page title, call flags) and the confirmation handshake. Replay
+ * data ("messages"/"messages_gz"), calls, remote control and canvas streams
+ * stay blocked until approval.
+ */
+const PRE_CONFIRM_ALLOWED_EVENTS = new Set([
+  "UPDATE_SESSION",
+  "session_confirm_pending",
+  "session_confirm_accepted",
+  "session_confirm_rejected",
+]);
+
+/**
+ * Controls when assist connects to the server.
+ */
+export enum Autostart {
+  /** Never auto-connect; assist starts only via an explicit start() call. */
+  Disabled = "disabled",
+  /**
+   * Auto-connect on reload only if start() was called earlier in this
+   * browser session (persisted in sessionStorage). stop() cancels it.
+   */
+  Continuation = "continuation",
+  /** Always auto-connect on tracker start (default, legacy behavior). */
+  Auto = "auto",
+}
 
 type StartEndCallback = (agentInfo?: Record<string, any>) => (() => any) | void;
 
@@ -37,12 +77,18 @@ export interface Options {
   onCallDeny?: () => any;
   onRemoteControlDeny?: (agentInfo: Record<string, any>) => any;
   onRecordingDeny?: (agentInfo: Record<string, any>) => any;
+  /** Called when the user approves session viewing (requestConfirm mode). */
+  onSessionConfirmApprove?: (agentInfo: Record<string, any>) => any;
+  /** Called when the user denies session viewing (requestConfirm mode). */
+  onSessionConfirmDeny?: (agentInfo: Record<string, any>) => any;
   onDragCamera?: (dx: number, dy: number) => void;
   session_calling_peer_key: string;
   session_control_peer_key: string;
   callConfirm: ConfirmOptions;
   controlConfirm: ConfirmOptions;
   recordingConfirm: ConfirmOptions;
+  /** Text/style customization for the session view confirmation popup. */
+  sessionConfirm: ConfirmOptions;
   socketHost?: string;
 
   // @deprecated
@@ -58,6 +104,37 @@ export interface Options {
    * @default 5000
    */
   compressionMinBatchSize: number;
+  /**
+   * Show only the first part of an agent's name in the call popup
+   * (e.g. "One Two" -> "One").
+   * @default false
+   */
+  agentShortNames: boolean;
+  /**
+   * Postpone assist start until a userID is set on the session.
+   * @default false
+   */
+  ignoreAnonymous: boolean;
+  /**
+   * When assist connects to the server:
+   * - Autostart.Auto (default): always on tracker start.
+   * - Autostart.Disabled: only via an explicit start() call.
+   * - Autostart.Continuation: only via start(), but the choice is remembered
+   *   in sessionStorage so it auto-continues across page reloads until stop().
+   * @default Autostart.Auto
+   */
+  autostart: Autostart;
+  /**
+   * Require explicit user confirmation before the session is shared with an
+   * agent: assist starts and opens the socket as usual, but no replay data
+   * (and no call, remote control or canvas stream) goes through it until the
+   * user approves the confirmation popup, which is shown as soon as the first
+   * agent connects. Session metadata updates (userID, metadata, page title,
+   * tab activity) keep flowing so the live-session list stays accurate. The
+   * approval is remembered per-tab (sessionStorage) until stop() is called.
+   * @default false
+   */
+  requestConfirm: boolean;
 }
 
 enum CallingState {
@@ -79,14 +156,23 @@ export default class Assist {
 
   private socket: Socket | null = null;
   private calls: Map<string, RTCPeerConnection> = new Map();
-  private canvasPeers: { [id: number]: RTCPeerConnection | null } = {};
+  private canvasPeers: Map<string, RTCPeerConnection> = new Map();
   private canvasNodeCheckers: Map<number, any> = new Map();
   private assistDemandedRestart = false;
+  private userStopped = false;
+  private pendingStart: (() => void) | null = null;
+  private titleNode: HTMLTitleElement | null = null;
+  private titleObserver: MutationObserver | null = null;
   private callingState: CallingState = CallingState.False;
   private remoteControl: RemoteControl | null = null;
   private peerReconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private socketReconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private socketStableTimeout: ReturnType<typeof setTimeout> | null = null;
+  private socketReconnectAttempts = 0;
   private agents: Record<string, Agent> = {};
   private config: RTCIceServer[] | undefined;
+  private sessionConfirmed = false;
+  private sessionConfirmWindow: ConfirmWindow | null = null;
   private readonly options: Options;
   private readonly canvasMap: Map<number, Canvas> = new Map();
   private iceCandidatesBuffer: Map<string, RTCIceCandidateInit[]> = new Map();
@@ -117,15 +203,24 @@ export default class Assist {
         callConfirm: {},
         controlConfirm: {}, // TODO: clear options passing/merging/overwriting
         recordingConfirm: {},
+        sessionConfirm: {},
+        requestConfirm: false,
         socketHost: "",
         compressionEnabled: false,
         compressionMinBatchSize: 5000,
+        agentShortNames: false,
+        ignoreAnonymous: false,
+        autostart: Autostart.Auto,
       },
       options,
     );
 
     if (this.app.options.assistSocketHost) {
       this.options.socketHost = this.app.options.assistSocketHost;
+    }
+
+    if (this.options.requestConfirm) {
+      this.sessionConfirmed = sessionStorage.getItem(SS_CONFIRM_KEY) === "1";
     }
 
     if (document.hidden !== undefined) {
@@ -143,34 +238,41 @@ export default class Assist {
       "BroadcastChannel" in window ? new BroadcastChannel("or-assist") : null;
     this.tabBus?.addEventListener("message", this.handleTabStateMessage);
 
-    const titleNode = document.querySelector("title");
-    const observer =
-      titleNode &&
-      new MutationObserver(() => {
-        this.emit("UPDATE_SESSION", { pageTitle: document.title });
-      });
+    this.titleNode = document.querySelector("title");
+    this.titleObserver = this.titleNode
+      ? new MutationObserver(() => {
+          this.emit("UPDATE_SESSION", { pageTitle: document.title });
+        })
+      : null;
     app.attachStartCallback(() => {
-      if (this.assistDemandedRestart) {
+      if (this.assistDemandedRestart || this.userStopped) {
         return;
       }
-      this.onStart();
-      this.publishState({ type: "assist_state_check" })
-      observer &&
-        observer.observe(titleNode, {
-          subtree: true,
-          characterData: true,
-          childList: true,
-        });
+      // autostart gate: disabled never auto-connects, continuation only when
+      // start() was called earlier this browser session
+      if (!this.shouldAutoStart()) {
+        return;
+      }
+      // postpone start until a userID is attached to the session
+      if (this.options.ignoreAnonymous && !this.app.getSessionInfo().userID) {
+        this.pendingStart = this.beginAssist;
+        return;
+      }
+      this.beginAssist();
     });
     app.attachStopCallback(() => {
       if (this.assistDemandedRestart) {
         return;
       }
       this.clean();
-      observer && observer.disconnect();
+      // tracker stop => kill the connection completely; a genuine tracker
+      // restart must reconnect with a fresh socket (new session/tab identity)
+      // via onStart, not reuse this one.
+      this.socket = null;
+      this.titleObserver?.disconnect();
     });
     app.attachCommitCallback((messages) => {
-      if (this.agentsConnected) {
+      if (this.agentsConnected && this.sessionApproved) {
         const batchSize = messages.length;
         // @ts-ignore No need in statistics messages. TODO proper filter
         if (
@@ -199,7 +301,7 @@ export default class Assist {
           }
           toSend.forEach((batch) => {
             const str = JSON.stringify(batch);
-            const byteArr = new TextEncoder().encode(str);
+            const byteArr = textEncoder.encode(str);
             gzip(byteArr, { mtime: 0 }, (err, result) => {
               if (err) {
                 this.emit("messages", batch);
@@ -213,17 +315,320 @@ export default class Assist {
         }
       }
     });
-    app.session.attachUpdateCallback((sessInfo) =>
-      this.emit("UPDATE_SESSION", sessInfo),
-    );
+    app.session.attachUpdateCallback((sessInfo) => {
+      // ignoreAnonymous: fire the postponed start once a userID arrives
+      if (this.pendingStart && sessInfo.userID) {
+        const begin = this.pendingStart;
+        this.pendingStart = null;
+        begin();
+      }
+      this.emit("UPDATE_SESSION", sessInfo);
+    });
   }
 
-  private emit(ev: string, args?: any): void {
+  /** Connects assist and wires up the title/cross-tab state watchers. */
+  private beginAssist = () => {
+    this.onStart();
+    this.publishState({ type: "assist_state_check" });
+    if (this.titleObserver && this.titleNode) {
+      this.titleObserver.observe(this.titleNode, { childList: true });
+    }
+  };
+
+  private get continuationEnabled(): boolean {
+    return this.options.autostart === Autostart.Continuation;
+  }
+
+  /** Whether assist should connect automatically on tracker start. */
+  private shouldAutoStart(): boolean {
+    switch (this.options.autostart) {
+      case Autostart.Disabled:
+        return false;
+      case Autostart.Continuation:
+        return sessionStorage.getItem(SS_CONTINUE_KEY) === "1";
+      case Autostart.Auto:
+      default:
+        return true;
+    }
+  }
+
+  /**
+   * Stops assist: disconnects the socket and cleans up all connections.
+   * Assist won't restart automatically on the next tracker start until
+   * start() is called. In Autostart.Continuation mode this also clears the
+   * persisted flag, so a reload won't auto-continue.
+   */
+  public stop = () => {
+    this.userStopped = true;
+    this.pendingStart = null;
+    if (this.continuationEnabled) {
+      sessionStorage.removeItem(SS_CONTINUE_KEY);
+    }
+    if (this.options.requestConfirm) {
+      // explicit stop revokes the approval; next start re-prompts
+      sessionStorage.removeItem(SS_CONFIRM_KEY);
+      this.sessionConfirmed = false;
+    }
+    this.clean();
+  }
+
+  /**
+   * (Re)starts assist. No-op if the tracker itself isn't active yet (assist
+   * will start together with the tracker). Reuses the existing socket (and
+   * its handlers) when possible instead of re-running onStart, to avoid
+   * duplicating node/socket callbacks. In Autostart.Continuation mode it
+   * persists a flag so assist auto-continues across page reloads.
+   */
+  public start = () => {
+    this.userStopped = false;
+    // an explicit start supersedes any ignoreAnonymous postponement
+    this.pendingStart = null;
+    if (this.continuationEnabled) {
+      sessionStorage.setItem(SS_CONTINUE_KEY, "1");
+    }
+    if (!this.app.active()) {
+      return;
+    }
+    if (this.socket) {
+      this.socket.connect();
+      return;
+    }
+    this.beginAssist();
+  }
+
+  private emit(ev: string, args?: any, force = false): void {
+    // requestConfirm mode: no replay/media data leaves the socket until the
+    // user approves. Session metadata and the confirmation handshake still go
+    // out, so the live-session list keeps receiving updates while waiting.
+    if (
+      !force &&
+      !this.sessionApproved &&
+      !PRE_CONFIRM_ALLOWED_EVENTS.has(ev)
+    ) {
+      return;
+    }
     this.socket &&
       this.socket.emit(ev, {
         meta: { tabId: this.app.getTabId() },
         data: args,
       });
+  }
+
+  /**
+   * False only in requestConfirm mode while the user hasn't approved yet.
+   * Gates replay data, calls, remote control and canvas streams.
+   */
+  private get sessionApproved(): boolean {
+    return !this.options.requestConfirm || this.sessionConfirmed;
+  }
+
+  /**
+   * requestConfirm mode: shows the confirmation popup (once) and tells the
+   * connected agents the session is waiting for the user's approval.
+   */
+  private requestSessionConfirm = (agentInfo?: AgentInfo) => {
+    if (this.sessionApproved) {
+      return;
+    }
+    // let every agent (including ones connecting while the popup is already
+    // shown) know the session is waiting for user confirmation
+    this.emit("session_confirm_pending", undefined, true);
+    if (this.sessionConfirmWindow) {
+      return;
+    }
+    this.sessionConfirmWindow = new ConfirmWindow(
+      sessionConfirmDefault(this.options.sessionConfirm),
+    );
+    this.playNotificationSound();
+    this.sessionConfirmWindow
+      .mount()
+      .then((answer) => this.answerSessionConfirm(answer, agentInfo))
+      .catch(() => {}); // window removed without an answer
+  };
+
+  private answerSessionConfirm = (
+    answer: boolean,
+    agentInfo?: AgentInfo,
+    fromAnotherTab = false,
+  ) => {
+    this.closeSessionConfirmWindow();
+    if (answer) {
+      if (this.sessionConfirmed) {
+        return;
+      }
+      this.sessionConfirmed = true;
+      sessionStorage.setItem(SS_CONFIRM_KEY, "1");
+      this.emit("session_confirm_accepted", undefined, true);
+      try {
+        this.options.onSessionConfirmApprove?.(agentInfo || {});
+      } catch (e) {
+        this.app.debug.error(e);
+      }
+      // everything before the approval was suppressed; restart tracking so
+      // the agents receive a full snapshot
+      this.restartTracking(() =>
+        this.remoteControl?.reconnect(Object.keys(this.agents)),
+      );
+    } else {
+      this.emit("session_confirm_rejected", undefined, true);
+      try {
+        this.options.onSessionConfirmDeny?.(agentInfo || {});
+      } catch (e) {
+        this.app.debug.error(e);
+      }
+    }
+    if (!fromAnotherTab) {
+      this.publishState({
+        type: "assist_state",
+        update: "confirm",
+        confirmAnswer: answer,
+      });
+      if (answer) {
+        // the check sent at start was answered while this tab still discarded
+        // call/RC state; ask again now that mirroring is allowed
+        this.publishState({ type: "assist_state_check" });
+      }
+    }
+  };
+
+  private closeSessionConfirmWindow = () => {
+    this.sessionConfirmWindow?.remove();
+    this.sessionConfirmWindow = null;
+  };
+
+  private static readonly MAX_SOCKET_RECONNECT_ATTEMPTS = 5;
+  private static readonly SOCKET_STABLE_MS = 10000;
+
+  /** `connect` alone proves nothing: the server refuses only after accepting */
+  private armSocketStableReset = () => {
+    this.clearSocketStableReset();
+    this.socketStableTimeout = setTimeout(() => {
+      this.socketStableTimeout = null;
+      this.socketReconnectAttempts = 0;
+    }, Assist.SOCKET_STABLE_MS);
+  };
+
+  private clearSocketStableReset = () => {
+    if (this.socketStableTimeout) {
+      clearTimeout(this.socketStableTimeout);
+      this.socketStableTimeout = null;
+    }
+  };
+
+  private scheduleSocketReconnect = () => {
+    if (
+      this.userStopped ||
+      this.socketReconnectAttempts >= Assist.MAX_SOCKET_RECONNECT_ATTEMPTS
+    ) {
+      this.app.debug.warn("Assist: giving up on reconnecting the socket");
+      return;
+    }
+    if (this.socketReconnectTimeout) {
+      clearTimeout(this.socketReconnectTimeout);
+    }
+    const delay = Math.min(1000 * 2 ** this.socketReconnectAttempts, 10000);
+    this.socketReconnectAttempts++;
+    this.socketReconnectTimeout = setTimeout(() => {
+      this.socketReconnectTimeout = null;
+      if (this.userStopped || !this.socket || this.socket.connected) {
+        return;
+      }
+      this.socket.connect();
+    }, delay);
+  };
+
+  /** socket reconnected with agents already watching: register, resend snapshot */
+  private registerConnectedAgents = (
+    connected: { socketId: string; agentInfo?: AgentInfo }[],
+  ) => {
+    if (connected.length === 0) {
+      return;
+    }
+    this.cleanCanvasConnections();
+    connected.forEach(({ socketId, agentInfo }) => {
+      const known = this.agents[socketId];
+      this.agents[socketId] = {
+        ...known,
+        agentInfo: agentInfo ?? known?.agentInfo,
+        onDisconnect: known
+          ? known.onDisconnect
+          : this.options.onAgentConnect?.(agentInfo),
+      };
+    });
+    if (!this.sessionApproved) {
+      // restart (and snapshot) happens on approval instead
+      this.requestSessionConfirm(connected[0].agentInfo);
+      return;
+    }
+    this.restartTracking(() =>
+      this.remoteControl?.reconnect(Object.keys(this.agents)),
+    );
+  };
+
+  private restartInProgress = false;
+  private pendingRestartCallbacks: (() => void)[] = [];
+
+  /**
+   * Restarts the tracker app so agents receive a full DOM snapshot.
+   * Requests arriving while a restart is in flight (e.g. a second agent
+   * connecting during the stop phase, when app.active() is false) don't
+   * start another one — their callbacks run when the current restart ends.
+   */
+  private restartTracking(onRestarted?: () => void) {
+    if (this.restartInProgress) {
+      if (onRestarted) {
+        this.pendingRestartCallbacks.push(onRestarted);
+      }
+      return;
+    }
+    if (!this.app.active()) {
+      return;
+    }
+    this.restartInProgress = true;
+    if (onRestarted) {
+      this.pendingRestartCallbacks.push(onRestarted);
+    }
+    const finish = () => {
+      this.restartInProgress = false;
+      const callbacks = this.pendingRestartCallbacks;
+      this.pendingRestartCallbacks = [];
+      return callbacks;
+    };
+    this.assistDemandedRestart = true;
+    try {
+      this.app.stop(false);
+      this.app.clearBuffers();
+    } catch (e) {
+      // a throwing stop must not leave restartInProgress set forever
+      this.assistDemandedRestart = false;
+      finish();
+      this.app.debug.error(e);
+      return;
+    }
+    this.app.waitStatus(0).then(() => {
+      this.app.allowAppStart();
+      setTimeout(() => {
+        this.app
+          .start()
+          .then(() => {
+            this.assistDemandedRestart = false;
+          })
+          .then(() => {
+            finish().forEach((cb) => {
+              try {
+                cb();
+              } catch (e) {
+                this.app.debug.error(e);
+              }
+            });
+          })
+          .catch((e) => {
+            this.assistDemandedRestart = false;
+            finish();
+            this.app.debug.error(e);
+          });
+      }, 100);
+    });
   }
 
   private get agentsConnected(): boolean {
@@ -296,14 +701,29 @@ export default class Assist {
       if (args[0] !== "webrtc_call_ice_candidate") {
         app.debug.log("Socket:", ...args);
       }
-      socket.on("close", (e) => {
-        app.debug.warn("Socket closed:", e);
-      });
+    });
+    socket.on("close", (e) => {
+      app.debug.warn("Socket closed:", e);
+    });
+
+    socket.on("connect", () => {
+      this.armSocketStableReset();
+    });
+
+    socket.on("disconnect", () => {
+      this.clearSocketStableReset();
+    });
+
+    // stale socket with our tabId still in the room (page reload); socket.io
+    // never auto-reconnects after a server-side disconnect
+    socket.on("SESSION_ALREADY_CONNECTED", () => {
+      this.clearSocketStableReset();
+      this.scheduleSocketReconnect();
     });
 
     const onGrand = (id: string) => {
       if (!this.callUI) {
-        this.callUI = new CallWindow(app.debug.error, this.options.callUITemplate);
+        this.callUI = new CallWindow(app.debug.error, this.options.callUITemplate, this.options.agentShortNames);
       }
       if (this.remoteControl) {
         this.callUI?.showRemoteControl(this.remoteControl.releaseControl);
@@ -321,8 +741,12 @@ export default class Assist {
     };
     const onRelease = (id?: string | null, isDenied?: boolean) => {
       if (id) {
-        const cb = this.agents[id].onControlReleased;
-        delete this.agents[id].onControlReleased;
+        // agent may already be gone while RemoteControl still holds its id
+        const agent = this.agents[id];
+        const cb = agent?.onControlReleased;
+        if (agent) {
+          delete agent.onControlReleased;
+        }
         typeof cb === "function" && cb();
         this.emit("control_rejected", id);
       }
@@ -377,6 +801,7 @@ export default class Assist {
     }
     if (this.remoteControl !== null) {
       socket.on("request_control", (agentId, dataObj) => {
+        if (!this.sessionApproved) return;
         processEvent(agentId, dataObj, this.remoteControl?.requestControl);
       });
       socket.on("release_control", (agentId, dataObj) => {
@@ -441,61 +866,37 @@ export default class Assist {
         onDisconnect: this.options.onAgentConnect?.(info),
         agentInfo: info, // TODO ?
       };
-      if (this.app.active()) {
-        this.assistDemandedRestart = true;
-        this.app.stop(false);
-        this.app.clearBuffers();
-        this.app.waitStatus(0).then(() => {
-          this.app.allowAppStart();
-          setTimeout(() => {
-            this.app
-              .start()
-              .then(() => {
-                this.assistDemandedRestart = false;
-              })
-              .then(() => {
-                this.remoteControl?.reconnect([id]);
-              })
-              .catch((e) => {
-                this.assistDemandedRestart = false;
-                app.debug.error(e);
-              });
-          }, 100);
-        });
+      if (!this.sessionApproved) {
+        // nothing goes out until the user approves; the restart (and full
+        // snapshot) happens on approval instead
+        this.requestSessionConfirm(info);
+        return;
       }
+      this.restartTracking(() => this.remoteControl?.reconnect([id]));
     });
 
     socket.on("AGENTS_INFO_CONNECTED", (agentsInfo: AgentInfo[]) => {
-      this.cleanCanvasConnections();
-      agentsInfo.forEach((agentInfo) => {
-        if (!agentInfo.socketId) return;
-        this.agents[agentInfo.socketId] = {
-          agentInfo,
-          onDisconnect: this.options.onAgentConnect?.(agentInfo),
-        };
-      });
-      if (this.app.active()) {
-        this.assistDemandedRestart = true;
-        this.app.stop(false);
-        this.app.clearBuffers();
-        this.app.waitStatus(0).then(() => {
-          this.app.allowAppStart();
-          setTimeout(() => {
-            this.app
-              .start()
-              .then(() => {
-                this.assistDemandedRestart = false;
-              })
-              .then(() => {
-                this.remoteControl?.reconnect(Object.keys(this.agents));
-              })
-              .catch((e) => {
-                this.assistDemandedRestart = false;
-                app.debug.error(e);
-              });
-          }, 100);
-        });
-      }
+      this.registerConnectedAgents(
+        (agentsInfo || [])
+          .filter((agentInfo) => agentInfo?.socketId)
+          .map((agentInfo) => ({
+            socketId: agentInfo.socketId as string,
+            agentInfo,
+          })),
+      );
+    });
+
+    // servers without AGENTS_INFO_CONNECTED send socket ids only; deferred a
+    // tick so the richer event wins where both are sent
+    socket.on("AGENTS_CONNECTED", (ids: string[]) => {
+      const announced = ids || [];
+      setTimeout(() => {
+        const unknown = announced.filter((id) => id && !this.agents[id]);
+        if (unknown.length === 0) return;
+        this.registerConnectedAgents(
+          unknown.map((socketId) => ({ socketId })),
+        );
+      }, 0);
     });
 
     socket.on("AGENT_DISCONNECTED", (id) => {
@@ -504,18 +905,28 @@ export default class Assist {
       this.agents[id]?.onDisconnect?.();
       delete this.agents[id];
 
-      Object.values(this.calls).forEach((pc) => pc.close());
+      this.calls.forEach((pc) => pc.close());
       this.calls.clear();
 
       recordingState.stopAgentRecording(id);
       endAgentCall({ socketId: id });
+      if (!this.agentsConnected) {
+        // no one left waiting for an answer
+        this.closeSessionConfirmWindow();
+      }
     });
 
     socket.on("NO_AGENT", () => {
+      // before the agents wipe: onRelease needs the agent to run its callback
+      this.remoteControl?.releaseControl();
       Object.values(this.agents).forEach((a) => a.onDisconnect?.());
       this.cleanCanvasConnections();
       this.agents = {};
       if (recordingState.isActive) recordingState.stopRecording();
+      if (this.callingState !== CallingState.False || this.calls.size > 0) {
+        handleCallEnd();
+      }
+      this.closeSessionConfirmWindow();
     });
 
     socket.on("call_end", (socketId, msg) => {
@@ -536,7 +947,8 @@ export default class Assist {
     });
 
     socket.on("webrtc_canvas_answer", async (_, data: { answer; id }) => {
-      const pc = this.canvasPeers[data.id];
+      if (!this.sessionApproved) return;
+      const pc = this.canvasPeers.get(data.id);
       if (pc) {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
@@ -549,7 +961,8 @@ export default class Assist {
     socket.on(
       "webrtc_canvas_ice_candidate",
       async (_, data: { candidate; id }) => {
-        const pc = this.canvasPeers[data.id];
+        if (!this.sessionApproved) return;
+        const pc = this.canvasPeers.get(data.id);
         if (pc) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
@@ -575,6 +988,7 @@ export default class Assist {
     });
 
     socket.on("request_recording", (id, info) => {
+      if (!this.sessionApproved) return;
       if (app.getTabId() !== info.meta.tabId) return;
       const agentData = info.data;
       if (!recordingState.isActive) {
@@ -596,6 +1010,7 @@ export default class Assist {
     socket.on(
       "webrtc_call_offer",
       async (_, data: { from: string; offer: RTCSessionDescriptionInit }) => {
+        if (!this.sessionApproved) return;
         if (!this.calls.has(data.from)) {
           await handleIncomingCallOffer(data.from, data.offer);
         }
@@ -605,7 +1020,8 @@ export default class Assist {
     socket.on(
       "webrtc_call_ice_candidate",
       async (_, data: { from: string; candidate: RTCIceCandidateInit }) => {
-        const pc = this.calls[data.from];
+        if (!this.sessionApproved) return;
+        const pc = this.calls.get(data.from);
         if (pc) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
@@ -656,7 +1072,7 @@ export default class Assist {
 
     // call end handling
     const handleCallEnd = () => {
-      Object.values(this.calls).forEach((pc) => pc.close());
+      this.calls.forEach((pc) => pc.close());
       this.calls.clear();
       Object.values(lStreams).forEach((stream) => {
         stream.stop();
@@ -760,7 +1176,7 @@ export default class Assist {
         this.calls.set(from, pc);
 
         if (!this.callUI) {
-          this.callUI = new CallWindow(app.debug.error, this.options.callUITemplate);
+          this.callUI = new CallWindow(app.debug.error, this.options.callUITemplate, this.options.agentShortNames);
           this.callUI.setVideoToggleCallback((args: { enabled: boolean }) => {
             this.emit("videofeed", { streamId: from, enabled: args.enabled });
           });
@@ -897,25 +1313,27 @@ export default class Assist {
     };
 
     const startCanvasStream = async (stream: MediaStream, id: number) => {
+      // canvas streams go over WebRTC, not this.emit — gate them explicitly;
+      // the restart on approval re-triggers the node callbacks
+      if (!this.sessionApproved) return;
       for (const agent of Object.values(this.agents)) {
-        if (!agent.agentInfo) return;
+        if (!agent.agentInfo) continue;
 
         const uniqueId = `${agent.agentInfo.peerId}-${agent.agentInfo.id}-canvas-${id}`;
 
-        if (!this.canvasPeers[uniqueId]) {
-          this.canvasPeers[uniqueId] = new RTCPeerConnection({
-            iceServers: this.config,
-          });
+        if (!this.canvasPeers.has(uniqueId)) {
+          const peer = new RTCPeerConnection({ iceServers: this.config });
+          this.canvasPeers.set(uniqueId, peer);
           this.setupPeerListeners(uniqueId);
           this.applyBufferedIceCandidates(uniqueId);
 
           stream.getTracks().forEach((track) => {
-            this.canvasPeers[uniqueId]?.addTrack(track, stream);
+            peer.addTrack(track, stream);
           });
 
           // Create SDP offer
-          const offer = await this.canvasPeers[uniqueId].createOffer();
-          await this.canvasPeers[uniqueId].setLocalDescription(offer);
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
 
           // Send offer via signaling server
           socket.emit("webrtc_canvas_offer", { offer, id: uniqueId });
@@ -953,7 +1371,7 @@ export default class Assist {
   }
 
   private setupPeerListeners(id: string) {
-    const peer = this.canvasPeers[id];
+    const peer = this.canvasPeers.get(id);
     if (!peer) return;
     // ICE candidates
     peer.onicecandidate = (event) => {
@@ -978,49 +1396,60 @@ export default class Assist {
 
   // clear all data
   private clean() {
+    this.closeSessionConfirmWindow();
     // sometimes means new agent connected, so we keep id for control
     this.remoteControl?.releaseControl(false, true);
     if (this.peerReconnectTimeout) {
       clearTimeout(this.peerReconnectTimeout);
       this.peerReconnectTimeout = null;
     }
+    if (this.socketReconnectTimeout) {
+      clearTimeout(this.socketReconnectTimeout);
+      this.socketReconnectTimeout = null;
+    }
+    this.clearSocketStableReset();
     this.cleanCanvasConnections();
-    Object.values(this.calls).forEach((pc) => pc.close());
+    this.calls.forEach((pc) => pc.close());
     this.calls.clear();
     if (this.socket) {
       this.socket.disconnect();
       this.app.debug.log("Socket disconnected");
     }
     this.canvasMap.clear();
-    this.canvasPeers = {};
+    this.canvasPeers.clear();
     this.canvasNodeCheckers.forEach((int) => clearInterval(int));
     this.canvasNodeCheckers.clear();
     this.iceCandidatesBuffer.clear();
   }
 
   private cleanCanvasConnections() {
-    Object.values(this.canvasPeers).forEach((pc) => pc?.close());
-    this.canvasPeers = {};
-    this.socket?.emit("webrtc_canvas_restart");
+    this.canvasPeers.forEach((pc) => pc.close());
+    this.canvasPeers.clear();
+    // canvas signalling bypasses emit(); gate it explicitly so nothing is
+    // announced to agents before the user approved session viewing
+    if (this.sessionApproved) {
+      this.socket?.emit("webrtc_canvas_restart");
+    }
   }
 
   private stopCanvasStream(id: number) {
     for (const agent of Object.values(this.agents)) {
-      if (!agent.agentInfo) return;
+      if (!agent.agentInfo) continue;
 
       const uniqueId = `${agent.agentInfo.peerId}-${agent.agentInfo.id}-canvas-${id}`;
-      this.socket?.emit("webrtc_canvas_stop", { id: uniqueId });
-
-      if (this.canvasPeers[uniqueId]) {
-        this.canvasPeers[uniqueId]?.close();
-        delete this.canvasPeers[uniqueId];
-
-        this.canvasMap.get(id)?.stop();
-        this.canvasMap.delete(id);
-        this.canvasNodeCheckers.get(id) &&
-          clearInterval(this.canvasNodeCheckers.get(id));
-        this.canvasNodeCheckers.delete(id);
+      const peer = this.canvasPeers.get(uniqueId);
+      if (peer) {
+        this.socket?.emit("webrtc_canvas_stop", { id: uniqueId });
+        peer.close();
+        this.canvasPeers.delete(uniqueId);
       }
+    }
+    this.canvasMap.get(id)?.stop();
+    this.canvasMap.delete(id);
+    const interval = this.canvasNodeCheckers.get(id);
+    if (interval) {
+      clearInterval(interval);
+      this.canvasNodeCheckers.delete(id);
     }
   }
 
@@ -1043,16 +1472,46 @@ export default class Assist {
     if (!msg) return;
 
     if (msg.data.type === "assist_state_check") {
-      if (this.tabState.isCallActive || this.tabState.rcActive) {
-        this.publishState({ type: "assist_state", ...this.tabState });
+      // one message per topic: spreading tabState would carry its own `type`
+      // (and a stale `update`) back out and bounce the check between tabs
+      if (this.tabState.isCallActive) {
+        this.publishState({
+          type: "assist_state",
+          update: "call",
+          isCallActive: true,
+          agentIds: this.tabState.agentIds,
+        });
+      }
+      if (this.tabState.rcActive) {
+        this.publishState({
+          type: "assist_state",
+          update: "rc",
+          rcActive: this.tabState.rcActive,
+        });
       }
     }
 
     if (msg.data.type === "assist_state") {
+      if (msg.data.update === "confirm" && this.options.requestConfirm) {
+        // the user answered the session confirm popup in another tab
+        if (msg.data.confirmAnswer) {
+          if (!this.sessionConfirmed) {
+            this.answerSessionConfirm(true, undefined, true);
+          }
+        } else if (this.sessionConfirmWindow) {
+          this.answerSessionConfirm(false, undefined, true);
+        }
+      }
+      // another tab may already be sharing; never mirror a call or remote
+      // control into a tab whose user hasn't approved session viewing yet
+      if (!this.sessionApproved) {
+        Object.assign(this.tabState, msg.data);
+        return;
+      }
       if (msg.data.update === "call") {
         if (msg.data.isCallActive) {
           if (!this.callUI) {
-            this.callUI = new CallWindow(this.app.debug.error, this.options.callUITemplate);
+            this.callUI = new CallWindow(this.app.debug.error, this.options.callUITemplate, this.options.agentShortNames);
           }
           const initiateCallEnd = () => {
             this.emit("call_end");

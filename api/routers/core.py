@@ -15,6 +15,7 @@ from chalicelib.core.issue_tracking import github, integrations_global, integrat
     jira_cloud
 from chalicelib.core.log_tools import datadog, newrelic, stackdriver, elasticsearch, \
     sentry, bugsnag, cloudwatch, sumologic, rollbar
+from chalicelib.core.sessions import sessions_assignments
 from chalicelib.core.sourcemaps import sourcemaps
 from or_dependencies import OR_context, OR_role
 from routers.base import get_routers
@@ -401,6 +402,31 @@ def get_metadata(integrationProjectId: int, context: schemas.CurrentContext = De
     return {"data": data}
 
 
+@app.get('/{projectId}/assignments', tags=["assignment"])
+def get_all_assignments(projectId: int, context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions_assignments.get_all(project_id=projectId, user_id=context.user_id)
+    return {
+        'data': data
+    }
+
+
+@app.post('/{projectId}/sessions/{sessionId}/assign/projects/{integrationProjectId}', tags=["assignment"])
+def create_issue_assignment(projectId: int, sessionId: int, integrationProjectId,
+                            data: schemas.AssignmentSchema = Body(...),
+                            context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions_assignments.create_new_assignment(tenant_id=context.tenant_id, project_id=projectId,
+                                                      session_id=sessionId,
+                                                      creator_id=context.user_id, assignee=data.assignee,
+                                                      description=data.description, title=data.title,
+                                                      issue_type=data.issue_type,
+                                                      integration_project_id=integrationProjectId)
+    if "errors" in data.keys():
+        return data
+    return {
+        'data': data
+    }
+
+
 @app.get('/{projectId}/gdpr', tags=["projects", "gdpr"])
 def get_gdpr(projectId: int, context: schemas.CurrentContext = Depends(OR_context)):
     return {"data": projects.get_gdpr(project_id=projectId)}
@@ -462,13 +488,13 @@ def get_capture_status(projectId: int, context: schemas.CurrentContext = Depends
     return {"data": projects.get_capture_status(project_id=projectId)}
 
 
-@app.post('/{projectId}/sample_rate', tags=["projects"])
+@app.post('/{projectId}/sample_rate', tags=["projects"], dependencies=[OR_role("owner", "admin")])
 def update_capture_status(projectId: int, data: schemas.SampleRateSchema = Body(...),
                           context: schemas.CurrentContext = Depends(OR_context)):
     return {"data": projects.update_capture_status(project_id=projectId, changes=data)}
 
 
-@app.post('/{projectId}/conditions', tags=["projects"])
+@app.post('/{projectId}/conditions', tags=["projects"], dependencies=[OR_role("owner", "admin")])
 def update_conditions(projectId: int, data: schemas.ProjectSettings = Body(...),
                       context: schemas.CurrentContext = Depends(OR_context)):
     return {"data": projects.update_conditions(project_id=projectId, changes=data)}

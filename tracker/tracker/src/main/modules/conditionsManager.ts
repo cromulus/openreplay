@@ -147,20 +147,25 @@ export default class ConditionsManager {
     }
   }
 
-  durationInt: ReturnType<typeof setInterval> | null = null
+  durationInts: Array<ReturnType<typeof setInterval>> = []
+
+  private clearDurationInt(int: ReturnType<typeof setInterval>) {
+    clearInterval(int)
+    this.durationInts = this.durationInts.filter((i) => i !== int)
+  }
 
   processDuration(durationMs: number, condName: string) {
-    this.durationInt = setInterval(() => {
-      const sessionLength = performance.now()
-      if (sessionLength > durationMs) {
+    // Track each interval independently: with more than one duration condition a
+    // single shared field would leak every interval but the last, and the timer
+    // would keep firing after it triggered.
+    const int = setInterval(() => {
+      if (performance.now() > durationMs) {
+        this.clearDurationInt(int)
         this.trigger(condName)
       }
     }, 1000)
-    this.app.attachStopCallback(() => {
-      if (this.durationInt) {
-        clearInterval(this.durationInt)
-      }
-    })
+    this.durationInts.push(int)
+    this.app.attachStopCallback(() => this.clearDurationInt(int))
   }
 
   networkRequest(message: NetworkRequest) {
@@ -237,10 +242,14 @@ export default class ConditionsManager {
   pageLocationEvent(message: SetPageLocation) {
     // url - 1
     const urlConds = this.conditions.filter((c) => c.type === 'visited_url') as CommonCondition[]
-    if (urlConds) {
+    if (urlConds.length) {
+      let pathname = message[1]
+      try {
+        pathname = new URL(message[1]).pathname
+      } catch (e) {}
       urlConds.forEach((urlCond) => {
         const operator = operators[urlCond.operator] as (a: string, b: string[]) => boolean
-        if (operator && operator(message[1], urlCond.value)) {
+        if (operator && operator(pathname, urlCond.value)) {
           this.trigger(urlCond.name)
         }
       })
@@ -306,18 +315,31 @@ type Condition =
   | SessionDurationCondition
   | NetworkRequestCondition
 
+const str = (v: unknown) => (v == null ? '' : String(v))
+const list = (t: unknown): unknown[] => (Array.isArray(t) ? t : [t])
+const num = (t: unknown) => Number(list(t)[0])
+const eq = (val: unknown, t: unknown) => {
+  if (typeof val === 'number' || typeof t === 'number') {
+    const n = Number(t)
+    if (str(t).trim() !== '' && !Number.isNaN(n)) return Number(val) === n
+  }
+  return str(val) === str(t)
+}
+
 const operators = {
-  is: (val: string, target: string[]) => target.some((t) => val.includes(t)),
+  is: (val: unknown, target: unknown) => list(target).some((t) => eq(val, t)),
   isAny: () => true,
-  isNot: (val: string, target: string[]) => !target.some((t) => val.includes(t)),
-  contains: (val: string, target: string[]) => target.some((t) => val.includes(t)),
-  notContains: (val: string, target: string[]) => !target.some((t) => val.includes(t)),
-  startsWith: (val: string, target: string[]) => target.some((t) => val.startsWith(t)),
-  endsWith: (val: string, target: string[]) => target.some((t) => val.endsWith(t)),
-  greaterThan: (val: number, target: number) => val > target,
-  greaterOrEqual: (val: number, target: number) => val >= target,
-  lessOrEqual: (val: number, target: number) => val <= target,
-  lessThan: (val: number, target: number) => val < target,
+  isNot: (val: unknown, target: unknown) => !list(target).some((t) => eq(val, t)),
+  contains: (val: unknown, target: unknown) => list(target).some((t) => str(val).includes(str(t))),
+  notContains: (val: unknown, target: unknown) =>
+    !list(target).some((t) => str(val).includes(str(t))),
+  startsWith: (val: unknown, target: unknown) =>
+    list(target).some((t) => str(val).startsWith(str(t))),
+  endsWith: (val: unknown, target: unknown) => list(target).some((t) => str(val).endsWith(str(t))),
+  greaterThan: (val: unknown, target: unknown) => Number(val) > num(target),
+  greaterOrEqual: (val: unknown, target: unknown) => Number(val) >= num(target),
+  lessOrEqual: (val: unknown, target: unknown) => Number(val) <= num(target),
+  lessThan: (val: unknown, target: unknown) => Number(val) < num(target),
 }
 
 const mapCondition = (condition: Filter): Condition => {

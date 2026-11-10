@@ -1,6 +1,4 @@
 // @ts-nocheck
-import chroma from 'chroma-js';
-import * as htmlToImage from 'html-to-image';
 import { SESSION_FILTER } from 'App/constants/storageKeys';
 export * from './extraUtils';
 
@@ -261,8 +259,6 @@ export const titleize = (str) => {
   return newStr;
 };
 
-export const colorScale = (values, colors) => chroma.scale(colors);
-
 export const truncate = (input, max = 10) =>
   input.length > max ? `${input.substring(0, max)}...` : input;
 
@@ -316,6 +312,9 @@ export const positionOfTheNumber = (min, max, value, length) => {
 };
 
 export const convertElementToImage = async (el: HTMLElement) => {
+  // ~100 modules import this barrel; a static import would park html-to-image
+  // on the critical path for the one PDF-export flow that uses it.
+  const htmlToImage = await import('html-to-image');
   // const fontEmbedCss = await htmlToImage.getFontEmbedCSS(el);
   const image = await htmlToImage.toJpeg(el, {
     pixelRatio: 2,
@@ -406,12 +405,12 @@ export const compareJsonObjects = (obj1: any, obj2: any) =>
   JSON.stringify(obj1) === JSON.stringify(obj2);
 
 export const getInitials = (name = '') => {
-  const names = name.split(' ');
-  if (names.every((n) => !n)) return '';
+  const names = (name ?? '').split(' ').filter(Boolean);
+  if (!names.length) return '';
 
   return names
     .slice(0, 2)
-    .map((n: any) => n[0].toUpperCase())
+    .map((n: string) => [...n][0].toUpperCase())
     .join('');
 };
 export function getTimelinePosition(value: any, scale: any) {

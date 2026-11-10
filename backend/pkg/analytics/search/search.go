@@ -7,6 +7,7 @@ import (
 	"maps"
 	"openreplay/backend/pkg/db/postgres/pool"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,9 +16,9 @@ import (
 	"openreplay/backend/pkg/analytics/model"
 
 	"openreplay/backend/pkg/logger"
+	"openreplay/backend/pkg/projects"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/lib/pq"
 )
 
 type Search interface {
@@ -32,13 +33,15 @@ type searchImpl struct {
 	pgConn     pool.Pool
 	Logger     logger.Logger
 	filterRefs []lexicon.FilterRef
+	projects   projects.Projects
 }
 
-func New(logger logger.Logger, chConn driver.Conn, pgConn pool.Pool, segments lexicon.Segments) (Search, error) {
+func New(logger logger.Logger, chConn driver.Conn, pgConn pool.Pool, segments lexicon.Segments, projectsService projects.Projects) (Search, error) {
 	return &searchImpl{
-		chConn: chConn,
-		pgConn: pgConn,
-		Logger: logger,
+		chConn:   chConn,
+		pgConn:   pgConn,
+		Logger:   logger,
+		projects: projectsService,
 		filterRefs: []lexicon.FilterRef{
 			lexicon.NewSegmentFilterRef(segments),
 		},
@@ -73,6 +76,9 @@ SELECT DISTINCT ON (session_id)
 	s.screen_width,
 	s.screen_height,
 	greatest(s.events_count,1) AS events_count,
+	s.errors_count,
+	s.pages_count,
+	s.issue_types,
 	viewed_sessions.session_id>0 AS viewed,
 	count(DISTINCT session_id) OVER() AS total_number_of_sessions
 	%s
@@ -115,10 +121,10 @@ func (s *searchImpl) GetAll(ctx context.Context, projectId int, userId uint64, r
 	}
 
 	if len(req.Series) > 0 {
-		return s.getSeriesSessions(projectId, userId, req)
+		return s.getSeriesSessions(ctx, projectId, userId, req)
 	}
 
-	return s.getSingleSessions(projectId, userId, req)
+	return s.getSingleSessions(ctx, projectId, userId, req)
 }
 
 type sessionsQueryComponents struct {
@@ -206,13 +212,13 @@ func (s *searchImpl) buildSessionsQueryComponents(projectId int, userId uint64, 
 	}
 }
 
-func (s *searchImpl) getSingleSessions(projectId int, userId uint64, req *model.SessionsSearchRequest) (*model.GetSessionsResponse, error) {
+func (s *searchImpl) getSingleSessions(ctx context.Context, projectId int, userId uint64, req *model.SessionsSearchRequest) (*model.GetSessionsResponse, error) {
 	qc := s.buildSessionsQueryComponents(projectId, userId, req)
 
 	var metasMap map[string]string = s.getMetadataColumns(projectId)
 	var metas string = ""
 	if len(metasMap) > 0 {
-		metas = "," + strings.Join(slices.Collect(maps.Keys(metasMap)), ",")
+		metas = "," + strings.Join(sortedMetadataColumns(metasMap), ",")
 	}
 	query := fmt.Sprintf(sessionsQuery,
 		metas,
@@ -228,11 +234,11 @@ func (s *searchImpl) getSingleSessions(projectId int, userId uint64, req *model.
 
 	resp := &model.GetSessionsResponse{Sessions: make([]model.Session, 0)}
 	_start := time.Now()
-	if err := s.chConn.Select(context.Background(), &resp.Sessions, query); err != nil {
+	if err := s.chConn.Select(ctx, &resp.Sessions, query); err != nil {
 		if time.Since(_start) > 2*time.Second {
-			s.Logger.Warn(context.Background(), "Slow getSingleSession select: %s", query)
+			s.Logger.Warn(ctx, "Slow getSingleSession select: %s", query)
 		}
-		s.Logger.Warn(context.Background(), "Error executing query: %s\nQuery: %s", err, query)
+		s.Logger.Warn(ctx, "Error executing query: %s\nQuery: %s", err, query)
 		return nil, err
 	}
 	if len(resp.Sessions) > 0 {
@@ -242,7 +248,7 @@ func (s *searchImpl) getSingleSessions(projectId int, userId uint64, req *model.
 	return resp, nil
 }
 
-func (s *searchImpl) getSeriesSessions(projectId int, userId uint64, req *model.SessionsSearchRequest) (*model.SeriesSessionsResponse, error) {
+func (s *searchImpl) getSeriesSessions(ctx context.Context, projectId int, userId uint64, req *model.SessionsSearchRequest) (*model.SeriesSessionsResponse, error) {
 	startSec := req.StartDate / 1000
 	endSec := req.EndDate / 1000
 	offset := (req.Page - 1) * req.Limit
@@ -304,7 +310,7 @@ func (s *searchImpl) getSeriesSessions(projectId int, userId uint64, req *model.
 		metasMap = s.getMetadataColumns(projectId)
 		var metas string = ""
 		if len(metasMap) > 0 {
-			metas = "," + strings.Join(slices.Collect(maps.Keys(metasMap)), ",")
+			metas = "," + strings.Join(sortedMetadataColumns(metasMap), ",")
 		}
 		query := fmt.Sprintf(sessionsQuery,
 			metas,
@@ -325,11 +331,11 @@ func (s *searchImpl) getSeriesSessions(projectId int, userId uint64, req *model.
 		}
 
 		_start := time.Now()
-		if err := s.chConn.Select(context.Background(), &seriesData.Sessions, query); err != nil {
+		if err := s.chConn.Select(ctx, &seriesData.Sessions, query); err != nil {
 			if time.Since(_start) > 2*time.Second {
-				s.Logger.Warn(context.Background(), "Slow getSeriesSessions [series %d]: %s", i, query)
+				s.Logger.Warn(ctx, "Slow getSeriesSessions [series %d]: %s", i, query)
 			}
-			s.Logger.Error(context.Background(), "Error executing query: %s\nQuery: %s", err, query)
+			s.Logger.Error(ctx, "Error executing query: %s\nQuery: %s", err, query)
 			return nil, err
 		}
 		if len(seriesData.Sessions) > 0 {
@@ -341,33 +347,33 @@ func (s *searchImpl) getSeriesSessions(projectId int, userId uint64, req *model.
 	return response, nil
 }
 
+func sortedMetadataColumns(metasMap map[string]string) []string {
+	keys := slices.Collect(maps.Keys(metasMap))
+	slices.SortFunc(keys, func(a, b string) int {
+		ai, _ := strconv.Atoi(strings.TrimPrefix(a, "metadata_"))
+		bi, _ := strconv.Atoi(strings.TrimPrefix(b, "metadata_"))
+		return ai - bi
+	})
+	return keys
+}
+
 func (s *searchImpl) getMetadataColumns(projectId int) map[string]string {
-	row, err := s.pgConn.Query(`
-SELECT metadata_1, metadata_2, metadata_3, metadata_4, metadata_5,
-metadata_6, metadata_7, metadata_8, metadata_9, metadata_10
-FROM projects
-WHERE project_id = $1;`, projectId)
+	result := make(map[string]string)
+	if s.projects == nil {
+		return result
+	}
+	p, err := s.projects.GetProject(uint32(projectId))
 	if err != nil {
-		return nil
+		s.Logger.Error(context.Background(), "Error getting project metadata: %v", err)
+		return result
 	}
-	defer row.Close()
-	// Move to first row
-	if !row.Next() {
-		s.Logger.Debug(context.Background(), "No rows found")
-		return make(map[string]string)
+	metas := []*string{
+		p.Metadata1, p.Metadata2, p.Metadata3, p.Metadata4, p.Metadata5,
+		p.Metadata6, p.Metadata7, p.Metadata8, p.Metadata9, p.Metadata10,
 	}
-	// Get values
-	values, err := row.Values()
-	if err != nil {
-		s.Logger.Error(context.Background(), "Error getting values: %v", err)
-		return make(map[string]string)
-	}
-	// Get column names
-	fields := row.FieldDescriptions()
-	var result map[string]string = make(map[string]string)
-	for i, field := range fields {
-		if values[i] != nil {
-			result[string(field.Name)] = values[i].(string)
+	for i, meta := range metas {
+		if meta != nil {
+			result[fmt.Sprintf("metadata_%d", i+1)] = *meta
 		}
 	}
 	return result
@@ -463,7 +469,7 @@ LIMIT $3 OFFSET $4`,
 			&session.UserState,
 			&session.EventsCount,
 			&session.PagesCount,
-			pq.Array(&session.IssueTypes),
+			&session.IssueTypes,
 			&session.Viewed,
 			&session.TotalNumberOfSessions,
 			&session.Metadata1,
@@ -494,6 +500,79 @@ LIMIT $3 OFFSET $4`,
 	return resp, nil
 }
 
+const countsQuerySettings = "max_execution_time = 10, max_threads = 4, " +
+	"use_query_cache = 1, query_cache_ttl = 1800, query_cache_min_query_duration = 200"
+
+func buildCountsQuery(projectId int, req *model.SessionsSearchRequest) string {
+	startSec := req.StartDate / 1000
+	endSec := req.EndDate / 1000
+
+	eventsWhere, filtersWhere, negativeEventsWhere, sessionsWhere := charts.BuildWhere(req.Filters, req.EventsOrder, "e", "s")
+	sessionsWhere = append([]string{
+		fmt.Sprintf("s.project_id = %d", projectId),
+		fmt.Sprintf("s.datetime >= toDateTime(%d)", startSec),
+		fmt.Sprintf("s.datetime < toDateTime(%d)", endSec),
+	}, sessionsWhere...)
+
+	if sub := eventSessionsSubquery(projectId, startSec, endSec, eventsWhere, filtersWhere, req.EventsOrder); sub != "" {
+		sessionsWhere = append(sessionsWhere, fmt.Sprintf("s.session_id IN (%s\n\t)", sub))
+	}
+
+	if len(negativeEventsWhere) > 0 {
+		negConds := []string{
+			fmt.Sprintf("e.project_id = %d", projectId),
+			fmt.Sprintf("e.created_at >= toDateTime(%d)", startSec),
+			fmt.Sprintf("e.created_at < toDateTime(%d)", endSec),
+		}
+		negConds = append(negConds, negativeEventsWhere...)
+		sessionsWhere = append(sessionsWhere, fmt.Sprintf(`s.session_id NOT IN (
+		SELECT session_id
+		FROM product_analytics.events AS e
+		WHERE %s
+	)`, strings.Join(negConds, " AND\n\t\t      ")))
+	}
+
+	return fmt.Sprintf(`
+SELECT uniq(s.session_id) AS sessions_count,
+       uniqIf(s.user_id, ifNull(s.user_id, '') != '') AS users_count
+FROM experimental.sessions AS s
+WHERE %s
+SETTINGS %s;`,
+		strings.Join(sessionsWhere, " AND\n      "),
+		countsQuerySettings,
+	)
+}
+
+func eventSessionsSubquery(projectId int, startSec, endSec int64, eventsWhere, filtersWhere []string, eventsOrder string) string {
+	if len(eventsWhere) == 0 && len(filtersWhere) == 0 {
+		return ""
+	}
+
+	conds := []string{
+		fmt.Sprintf("e.project_id = %d", projectId),
+		fmt.Sprintf("e.created_at >= toDateTime(%d)", startSec),
+		fmt.Sprintf("e.created_at < toDateTime(%d)", endSec),
+	}
+	conds = append(conds, filtersWhere...)
+
+	groupBy := charts.BuildJoinClause(eventsOrder, eventsWhere)
+	switch {
+	case len(eventsWhere) == 1:
+		conds = append(conds, eventsWhere[0])
+	case len(eventsWhere) > 1 && groupBy != "":
+		conds = append(conds, "("+strings.Join(eventsWhere, " OR ")+")")
+	}
+
+	if groupBy != "" {
+		groupBy = "\n\t\t" + strings.ReplaceAll(groupBy, "\n", "\n\t\t")
+	}
+
+	return fmt.Sprintf(`
+		SELECT session_id
+		FROM product_analytics.events AS e
+		WHERE %s%s`, strings.Join(conds, " AND\n\t\t      "), groupBy)
+}
+
 func (s *searchImpl) GetCounts(ctx context.Context, projectId int, req *model.SessionsSearchRequest) (int64, int64, error) {
 	if req == nil {
 		return 0, 0, errors.New("nil request")
@@ -502,73 +581,7 @@ func (s *searchImpl) GetCounts(ctx context.Context, projectId int, req *model.Se
 		return 0, 0, err
 	}
 
-	startSec := req.StartDate / 1000
-	endSec := req.EndDate / 1000
-
-	eventsWhere, filtersWhere, negativeEventsWhere, sessionsWhere := charts.BuildWhere(req.Filters, req.EventsOrder, "e", "s")
-	sessionsWhere = append([]string{
-		fmt.Sprintf("s.project_id = %d", projectId),
-		fmt.Sprintf("s.datetime BETWEEN toDateTime(%d) AND toDateTime(%d)", startSec, endSec),
-	}, sessionsWhere...)
-
-	hasEventFilters := len(eventsWhere) > 0 || len(filtersWhere) > 0
-
-	var distinctIdJoin string
-	if hasEventFilters {
-		conds := []string{
-			fmt.Sprintf("e.project_id = %d", projectId),
-			fmt.Sprintf("e.created_at BETWEEN toDateTime(%d) AND toDateTime(%d)", startSec, endSec),
-		}
-		conds = append(conds, filtersWhere...)
-		if len(eventsWhere) == 1 {
-			conds = append(conds, eventsWhere[0])
-		}
-		groupBy := charts.BuildJoinClause(req.EventsOrder, eventsWhere)
-		if groupBy == "" {
-			groupBy = "GROUP BY session_id"
-		}
-		distinctIdJoin = fmt.Sprintf(`ANY INNER JOIN (
-		SELECT session_id, any(distinct_id) AS distinct_id
-		FROM product_analytics.events AS e
-		WHERE %s
-		%s
-	) AS fs USING (session_id)`,
-			strings.Join(conds, " AND \n"), groupBy)
-	} else {
-		distinctIdJoin = fmt.Sprintf(`ANY LEFT JOIN (
-		SELECT session_id, any(distinct_id) AS distinct_id
-		FROM product_analytics.events
-		WHERE project_id = %d
-		  AND created_at BETWEEN toDateTime(%d) AND toDateTime(%d)
-		GROUP BY session_id
-	) AS fs USING (session_id)`, projectId, startSec, endSec)
-	}
-
-	var leftAntiJoin string
-	if len(negativeEventsWhere) > 0 {
-		negConds := []string{
-			fmt.Sprintf("e.project_id = %d", projectId),
-			fmt.Sprintf("e.created_at BETWEEN toDateTime(%d) AND toDateTime(%d)", startSec, endSec),
-		}
-		negConds = append(negConds, negativeEventsWhere...)
-		leftAntiJoin = fmt.Sprintf(`LEFT ANTI JOIN (
-		SELECT DISTINCT session_id
-		FROM product_analytics.events AS e
-		WHERE %s
-	) AS negative_sessions USING (session_id)`, strings.Join(negConds, " AND \n"))
-	}
-
-	query := fmt.Sprintf(`
-SELECT countDistinct(s.session_id) AS sessions_count,
-       countDistinctIf(fs.distinct_id, fs.distinct_id != '') AS users_count
-FROM experimental.sessions AS s
-	%s
-	%s
-WHERE %s;`,
-		distinctIdJoin,
-		leftAntiJoin,
-		strings.Join(sessionsWhere, " AND "),
-	)
+	query := buildCountsQuery(projectId, req)
 
 	var sessionsCount, usersCount uint64
 	_start := time.Now()
@@ -599,13 +612,11 @@ SELECT
 FROM experimental.sessions AS s
 	%s
 	%s
-	%s
 WHERE %s
 ORDER BY %s %s
 LIMIT %d OFFSET %d;`,
 		qc.eventsInnerJoin,
 		qc.leftAntiJoin,
-		qc.viewedJoin,
 		strings.Join(qc.sessionsWhere, " AND "),
 		qc.sortField,
 		qc.sortOrder,
@@ -615,12 +626,12 @@ LIMIT %d OFFSET %d;`,
 
 	_start := time.Now()
 	sessionIds := make([]model.SessionIdData, 0)
-	if err := s.chConn.Select(context.Background(), &sessionIds, query); err != nil {
-		s.Logger.Error(context.Background(), "Error executing GetSessionIds query: %s\nQuery: %s", err, query)
+	if err := s.chConn.Select(ctx, &sessionIds, query); err != nil {
+		s.Logger.Error(ctx, "Error executing GetSessionIds query: %s\nQuery: %s", err, query)
 		return nil, err
 	}
 	if time.Since(_start) > 2*time.Second {
-		s.Logger.Warn(context.Background(), "Slow GetSessionIds select: %s", query)
+		s.Logger.Warn(ctx, "Slow GetSessionIds select: %s", query)
 	}
 	return sessionIds, nil
 }

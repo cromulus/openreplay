@@ -16,6 +16,8 @@ temp_env_file=$(mktemp)
 # Function to merge environment variables from original to new env file
 function merge_envs() {
 	while IFS='=' read -r key value; do
+		# Skip blank lines, comments, and any line without a key
+		[[ -z "$key" || "$key" == \#* ]] && continue
 		# Skip the line if the key is COMMON_VERSION
 		case "$key" in
 		COMMON_VERSION)
@@ -25,8 +27,8 @@ function merge_envs() {
 		COMMON_PG_PASSWORD)
 			pgpassword=$(echo $value | xargs)
 			;;
-		POSTGRES_VERSION | REDIS_VERSION | MINIO_VERSION)
-			# Don't update db versions automatically.
+		*_VERSION)
+			# Keep release-owned image versions from the new template.
 			continue
 			;;
 		esac
@@ -36,6 +38,15 @@ function merge_envs() {
 		mv "$temp_env_file" "$new_env_file"
 		echo "$key=$value" >>"$new_env_file"
 	done <"$original_env_file"
+}
+
+# Secrets added to the template since the old install still hold public
+# change_me_ placeholders after merging; give them random values.
+function generate_new_secrets() {
+	local token
+	for token in $(grep -o 'change_me_[a-zA-Z0-9_]*' "$new_env_file" | grep -vx 'change_me_domain' | sort -u); do
+		sed -i "s/=${token}$/=$(openssl rand -hex 10)/" "$new_env_file"
+	done
 }
 
 # Function to normalize version numbers for comparison
@@ -103,7 +114,7 @@ function migrate() {
 	# Loop through versions and prepare Docker run commands
 	for ver in "${joined_migration_versions[@]}"; do
 		echo "$ver"
-		docker run --rm --network docker-compose_opereplay-net \
+		docker run --rm --network docker-compose_openreplay-net \
 			--name pgmigrate -e PGHOST=postgres -e PGPORT=5432 \
 			-e PGDATABASE=postgres -e PGUSER=postgres -e PGPASSWORD=$pgpassword \
 			-v $SCHEMA_DIR:/opt/data/ postgres psql -f /opt/data/db/init_dbs/postgresql/$ver/$ver.sql
@@ -112,6 +123,7 @@ function migrate() {
 
 # Merge environment variables and perform migration
 merge_envs
+generate_new_secrets
 migrate
 
 # Load variables from common.env into the current shell's environment
@@ -122,4 +134,4 @@ set +a
 # Use the `envsubst` command to substitute the shell environment variables into reference_var.env and output to a combined .env
 find ./ -type f \( -iname "*.env" -o -iname "docker-compose.yaml" \) ! -name "common.env" -exec /bin/bash -c 'file="{}";cp "$file" "$file.bak"; envsubst < "$file.bak" > "$file"; rm "$file.bak"' \;
 
-sudo -E docker-compose up -d
+sudo -E docker compose up -d

@@ -1,9 +1,11 @@
-import createNetworkProxy, { INetworkMessage } from "@openreplay/network-proxy";
+import createNetworkProxy from "@openreplay/network-proxy";
+import type { INetworkMessage } from "@openreplay/network-proxy";
 import {
-  SpotNetworkRequest,
   getTopWindow,
   getNetworkRequestType,
 } from "./networkTrackingUtils";
+import type { SpotNetworkRequest } from "./networkTrackingUtils";
+import { pageMessages } from "~/utils/pageMessages";
 
 let defaultFetch: typeof fetch | undefined;
 let defaultXhr: typeof XMLHttpRequest | undefined;
@@ -21,7 +23,10 @@ export function startNetwork() {
     (reqRes) => reqRes,
     (msg) => {
       const event = createSpotNetworkRequest(msg);
-      window.postMessage({ type: "ort:bump-network", event }, "*");
+      window.postMessage(
+        { type: pageMessages.injected.bumpNetwork, event },
+        "*",
+      );
     },
     (url) =>
       url.includes("/spot/") || url.includes(".mob?") || url.includes(".mobe?"),

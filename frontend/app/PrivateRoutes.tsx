@@ -12,13 +12,13 @@ import {
   useHistory,
   useLocation,
 } from 'App/routing';
+import OnboardingGate from 'Components/Onboarding/OnboardingGate';
 import { Loader } from 'UI';
 
-import APIClient from './api_client';
+import { apiClient } from './api_client';
 import { useStore } from './mstore';
 import * as routes from './routes';
 import { saasRoutes } from './saasComponents';
-import { hasAi } from './utils/split-utils';
 
 const components: any = {
   SessionPure: lazy(() => import('Components/Session/Session')),
@@ -32,7 +32,6 @@ const components: any = {
   SpotsListPure: lazy(() => import('Components/Spots/SpotsList')),
   SpotPure: lazy(() => import('Components/Spots/SpotPlayer')),
   HighlightsPure: lazy(() => import('Components/Highlights/HighlightsList')),
-  KaiPure: lazy(() => import('Components/Kai/KaiChat')),
   ActivityPure: lazy(
     () => import('Components/DataManagement/Activity/ActivityPage'),
   ),
@@ -66,7 +65,6 @@ const enhancedComponents: any = {
   SpotsList: withSiteIdUpdater(components.SpotsListPure),
   Spot: components.SpotPure,
   Highlights: withSiteIdUpdater(components.HighlightsPure),
-  Kai: withSiteIdUpdater(components.KaiPure),
   ScopeSetup: components.ScopeSetup,
   Activity: withSiteIdUpdater(components.ActivityPure),
   UserPage: withSiteIdUpdater(components.UserPage),
@@ -111,16 +109,15 @@ const SPOTS_LIST_PATH = routes.spotsList();
 const SPOT_PATH = routes.spot();
 
 const HIGHLIGHTS_PATH = routes.highlights();
-const KAI_PATH = routes.kai();
+
+const SAAS_ROUTES = saasRoutes.map((route) => ({
+  path: route.path,
+  enabled: route.enabled,
+  Component: withSiteIdUpdater(route.component),
+}));
 
 function PrivateRoutes() {
-  const {
-    projectsStore,
-    userStore,
-    integrationsStore,
-    searchStore,
-    filterStore,
-  } = useStore();
+  const { projectsStore, userStore, searchStore, filterStore } = useStore();
   const location = useLocation();
   const history = useHistory();
   const onboarding = userStore.onboarding;
@@ -135,22 +132,22 @@ function PrivateRoutes() {
   const siteIdList: any = sites.map(({ id }) => id);
 
   const initialFetchDoneRef = React.useRef(false);
+  const lastFiltersSiteIdRef = React.useRef<string | null>(null);
   const [filtersLoaded, setFiltersLoaded] = React.useState(false);
 
   const IntegrationsRedirect: React.FC = () => {
     const location = useLocation();
 
     React.useEffect(() => {
-      const client = new APIClient();
       switch (location.pathname) {
         case '/integrations/slack':
-          client.post('integrations/slack/add', {
+          apiClient.post('integrations/slack/add', {
             code: location.search.split('=')[1],
             state: tenantId,
           });
           break;
         case '/integrations/msteams':
-          client.post('integrations/msteams/add', {
+          apiClient.post('integrations/msteams/add', {
             code: location.search.split('=')[1],
             state: tenantId,
           });
@@ -162,70 +159,83 @@ function PrivateRoutes() {
   };
 
   React.useEffect(() => {
-    if (!searchStore.urlParsed && filtersLoaded) {
-      const searchParams = new URLSearchParams(location.search);
-      const searchId = searchParams.get('sid');
-      const supportedFilters = [
-        'userId',
-        'distinct_id',
-        'userCountry',
-        'userCity',
-        'meta_',
-      ];
-      const parsedFilters = supportedFilters.filter((f) => searchParams.has(f));
+    if (searchStore.urlParsed || !siteId) return;
 
-      if (searchId) {
-        searchStore
-          .loadSharedSearch(searchId)
-          .then(() => {
-            searchParams.delete('sid');
-            const newSearch = searchParams.toString();
-            const newUrl = `${location.pathname}${newSearch ? `?${newSearch}` : ''}`;
-            history.replace(newUrl);
-            searchStore.setUrlParsed();
-            setTimeout(() => {
-              initialFetchDoneRef.current = true;
-            }, 500);
-          })
-          .catch((error) => {
-            console.error('Failed to load shared search:', error);
-            searchStore.setUrlParsed();
-            setTimeout(() => {
-              initialFetchDoneRef.current = true;
-            }, 500);
-          });
-      } else if (parsedFilters.length > 0) {
-        const start = searchParams.get('st_ts');
-        const end = searchParams.get('end_ts');
-        const filters: any[] = [];
-        parsedFilters.forEach((f, i) => {
-          const value = searchParams.get(f) as string;
-          const isMeta = f.startsWith('meta_');
-          const filterName = isMeta ? f.replace('meta_', '') : f;
-          const filter = filterStore.findEvent({ name: filterName });
-          if (filter) {
-            filter.value = [value];
-          }
-          filters.push(filter);
+    const searchParams = new URLSearchParams(location.search);
+    const searchId = searchParams.get('sid');
+    const supportedFilters = [
+      'userId',
+      'distinct_id',
+      'userCountry',
+      'userCity',
+      'meta_',
+    ];
+    const searchParamsKeys = Array.from(searchParams.keys());
+    const parsedFilters = searchParamsKeys.filter((key) =>
+      supportedFilters.some((f) =>
+        f === 'meta_' ? key.startsWith('meta_') : key === f,
+      ),
+    );
+
+    // only the two URL-driven branches read the filter catalogue; a plain load
+    // builds its search body from searchStore alone, so it must not queue
+    // behind /filters
+    if ((searchId || parsedFilters.length > 0) && !filtersLoaded) return;
+
+    if (searchId) {
+      searchStore
+        .loadSharedSearch(searchId)
+        .then(() => {
+          searchParams.delete('sid');
+          const newSearch = searchParams.toString();
+          const newUrl = `${location.pathname}${newSearch ? `?${newSearch}` : ''}`;
+          history.replace(newUrl);
+          searchStore.setUrlParsed();
+          setTimeout(() => {
+            initialFetchDoneRef.current = true;
+          }, 500);
+        })
+        .catch((error) => {
+          console.error('Failed to load shared search:', error);
+          searchStore.setUrlParsed();
+          setTimeout(() => {
+            initialFetchDoneRef.current = true;
+          }, 500);
         });
-        searchStore.edit({
-          filters,
-          startDate: start ? parseInt(start) : undefined,
-          endDate: end ? parseInt(end) : undefined,
-          rangeName: 'CUSTOM_RANGE',
-          rangeValue: 'CUSTOM_RANGE',
-        });
-        searchStore.setUrlParsed();
-        void searchStore.fetchSessions(true);
-      } else {
-        searchStore.setUrlParsed();
-        void searchStore.fetchSessions(true);
-        setTimeout(() => {
-          initialFetchDoneRef.current = true;
-        }, 500);
-      }
+    } else if (parsedFilters.length > 0) {
+      const start = searchParams.get('st_ts');
+      const end = searchParams.get('end_ts');
+      const filters: any[] = [];
+      parsedFilters.forEach((f, i) => {
+        const value = searchParams.get(f) as string;
+        const isMeta = f.startsWith('meta_');
+        const filterName = isMeta ? f.replace('meta_', '') : f;
+        const searchPayload = isMeta
+          ? { displayName: filterName }
+          : { name: filterName };
+        const filter = filterStore.findEvent(searchPayload);
+        if (filter) {
+          filter.value = [value];
+        }
+        filters.push(filter);
+      });
+      searchStore.edit({
+        filters,
+        startDate: start ? parseInt(start) : undefined,
+        endDate: end ? parseInt(end) : undefined,
+        rangeName: 'CUSTOM_RANGE',
+        rangeValue: 'CUSTOM_RANGE',
+      });
+      searchStore.setUrlParsed();
+      void searchStore.fetchSessions(true);
+    } else {
+      searchStore.setUrlParsed();
+      void searchStore.fetchSessions(true);
+      setTimeout(() => {
+        initialFetchDoneRef.current = true;
+      }, 500);
     }
-  }, [filtersLoaded, searchStore.urlParsed, location.search]);
+  }, [filtersLoaded, searchStore.urlParsed, location.search, siteId]);
 
   const debouncedSearchCall = React.useMemo(
     () => debounceCall(() => searchStore.fetchSessions(true), 250),
@@ -239,9 +249,8 @@ function PrivateRoutes() {
   React.useEffect(() => {
     const siteId = projectsStore.activeSiteId;
     searchStore.resetTags();
-    if (siteId && integrationsStore.integrations.siteId !== siteId) {
-      integrationsStore.integrations.setSiteId(siteId);
-      void integrationsStore.integrations.fetchIntegrations(siteId);
+    if (siteId && lastFiltersSiteIdRef.current !== siteId) {
+      lastFiltersSiteIdRef.current = siteId;
       filterStore
         .fetchFilters(siteId)
         .then(() => {
@@ -249,8 +258,15 @@ function PrivateRoutes() {
         })
         .catch((e) => {
           console.error(e);
-          // if filters failed, there may be some sessions still available in the list
-          void searchStore.fetchSessions(true);
+          // if filters failed, there may be some sessions still available in
+          // the list — unless the plain-load branch above already asked for them
+          if (!searchStore.urlParsed) {
+            searchStore.setUrlParsed();
+            void searchStore.fetchSessions(true);
+            setTimeout(() => {
+              initialFetchDoneRef.current = true;
+            }, 500);
+          }
         });
     }
   }, [projectsStore.activeSiteId]);
@@ -268,7 +284,11 @@ function PrivateRoutes() {
         />
         <Route
           path={withSiteId(`${ONBOARDING_PATH}/*`, siteIdList)}
-          element={<enhancedComponents.Onboarding />}
+          element={
+            <OnboardingGate>
+              <enhancedComponents.Onboarding />
+            </OnboardingGate>
+          }
         />
         <Route
           path={SPOTS_LIST_PATH}
@@ -366,12 +386,6 @@ function PrivateRoutes() {
           path={withSiteId(LIVE_SESSION_PATH, siteIdList)}
           element={<enhancedComponents.LiveSession />}
         />
-        {hasAi ? (
-          <Route
-            path={withSiteId(KAI_PATH, siteIdList)}
-            element={<enhancedComponents.Kai />}
-          />
-        ) : null}
         <Route
           path={withSiteId(routes.dataManagement.activity(), siteIdList)}
           element={<enhancedComponents.Activity />}
@@ -407,16 +421,15 @@ function PrivateRoutes() {
         {Object.entries(routes.redirects).map(([fr, to]) => (
           <Route key={fr} path={fr} element={<Navigate to={to} replace />} />
         ))}
-        {saasRoutes.map((route) => {
-          const Component = withSiteIdUpdater(route.component);
-          return (
+        {SAAS_ROUTES.filter((route) => route.enabled()).map(
+          ({ path, Component }) => (
             <Route
-              key={route.path}
-              path={withSiteId(route.path, siteIdList)}
+              key={path}
+              path={withSiteId(path, siteIdList)}
               element={<Component />}
             />
-          );
-        })}
+          ),
+        )}
         <Route path="*" element={<Navigate to={fallbackTo} replace />} />
       </StableRoutes>
     </Suspense>

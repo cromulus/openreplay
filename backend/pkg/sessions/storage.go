@@ -3,9 +3,6 @@ package sessions
 import (
 	"fmt"
 
-	"github.com/jackc/pgtype"
-	"github.com/lib/pq"
-
 	"openreplay/backend/pkg/db/postgres/pool"
 )
 
@@ -70,7 +67,7 @@ func (s *storageImpl) Add(sess *Session) error {
 func (s *storageImpl) Get(sessionID uint64) (*Session, error) {
 	sess := &Session{SessionID: sessionID}
 	var revID, userOSVersion, userBrowser, userBrowserVersion, userState, userCity *string
-	var issueTypes pgtype.EnumArray
+	var issueTypes []string
 	if err := s.db.QueryRow(`
 		SELECT platform,
 			duration, project_id, start_ts, timezone,
@@ -112,7 +109,7 @@ func (s *storageImpl) Get(sessionID uint64) (*Session, error) {
 	if revID != nil {
 		sess.RevID = *revID
 	}
-	issueTypes.AssignTo(&sess.IssueTypes)
+	sess.IssueTypes = issueTypes
 	if userState != nil {
 		sess.UserState = *userState
 	}
@@ -135,7 +132,7 @@ type scannable interface {
 }
 
 const sessionColumns = `session_id, platform,
-	CASE WHEN duration IS NULL OR duration < 0 THEN 0 ELSE duration END,
+	CASE WHEN duration < 0 THEN 0 ELSE duration END, -- keep NULL: it marks a session that was never ended
 	project_id, start_ts, timezone,
 	user_uuid, user_os, user_os_version,
 	user_device, user_device_type, user_country, user_state, user_city,
@@ -150,7 +147,7 @@ const sessionColumns = `session_id, platform,
 func scanSession(row scannable) (*Session, error) {
 	sess := &Session{}
 	var revID, userOSVersion, userBrowser, userBrowserVersion, userState, userCity *string
-	var issueTypes pgtype.EnumArray
+	var issueTypes []string
 	if err := row.Scan(
 		&sess.SessionID, &sess.Platform,
 		&sess.Duration, &sess.ProjectID, &sess.Timestamp, &sess.Timezone,
@@ -178,7 +175,7 @@ func scanSession(row scannable) (*Session, error) {
 	if revID != nil {
 		sess.RevID = *revID
 	}
-	issueTypes.AssignTo(&sess.IssueTypes)
+	sess.IssueTypes = issueTypes
 	if userState != nil {
 		sess.UserState = *userState
 	}
@@ -191,7 +188,7 @@ func scanSession(row scannable) (*Session, error) {
 func (s *storageImpl) GetMany(sessionIDs []uint64) ([]*Session, error) {
 	rows, err := s.db.Query(`SELECT `+sessionColumns+`
 		FROM sessions
-		WHERE session_id = ANY($1)`, pq.Array(sessionIDs))
+		WHERE session_id = ANY($1)`, sessionIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +242,7 @@ func (s *storageImpl) UpdateDurations(updates map[uint64]uint64) (map[uint64]uin
 		END
 		FROM unnest($1::bigint[], $2::bigint[]) AS v(session_id, ts)
 		WHERE s.session_id = v.session_id
-		RETURNING s.session_id, s.duration`, pq.Array(ids), pq.Array(timestamps))
+		RETURNING s.session_id, s.duration`, ids, timestamps)
 	if err != nil {
 		return nil, err
 	}

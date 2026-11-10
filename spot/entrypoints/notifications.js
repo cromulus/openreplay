@@ -1,4 +1,7 @@
+import { pageMessages } from "~/utils/pageMessages";
+
 export default defineUnlistedScript(() => {
+  const { notifications } = pageMessages;
   async function copyToTheClipboard(textToCopy) {
     const el = document.createElement("textarea");
     el.value = textToCopy;
@@ -39,12 +42,16 @@ export default defineUnlistedScript(() => {
   function createNotification(event) {
     const message = event.data.message || "Recording has started successfully.";
 
-    const notificationContent = `
-    <div class="or-flex or-gap-3 or-items-center">
-      <div class="or-spinner"></div>
-      <span>${message}</span>
-     </div>
-    `;
+    // Built as nodes, never interpolated HTML: the message text arrives over
+    // window.postMessage and must not be able to inject markup into the page.
+    const row = document.createElement("div");
+    row.className = "or-flex or-gap-3 or-items-center";
+    const spinner = document.createElement("div");
+    spinner.className = "or-spinner";
+    const label = document.createElement("span");
+    label.textContent = String(message);
+    row.appendChild(spinner);
+    row.appendChild(label);
 
     const notification = document.createElement("div");
 
@@ -62,7 +69,7 @@ export default defineUnlistedScript(() => {
     };
 
     Object.assign(notification.style, styles);
-    notification.innerHTML = notificationContent;
+    notification.appendChild(row);
     document.body.appendChild(notification);
 
     notification.offsetHeight;
@@ -77,10 +84,13 @@ export default defineUnlistedScript(() => {
 
   function initNotificationListener() {
     function handleMessage(event) {
-      if (event.data.type === "ornotif:display") {
+      // Only the content script in this same window posts these.
+      if (event.source !== window) return;
+      if (!event.data || typeof event.data !== "object") return;
+      if (event.data.type === notifications.display) {
         createNotification(event);
       }
-      if (event.data.type === "ornotif:copy") {
+      if (event.data.type === notifications.copy) {
         copyToTheClipboard(event.data.url)
           .then(() => {
             createNotification({
@@ -91,7 +101,7 @@ export default defineUnlistedScript(() => {
             console.error(e);
           });
       }
-      if (event.data.type === "ornotif:stop") {
+      if (event.data.type === notifications.stop) {
         window.removeEventListener("message", handleMessage);
       }
     }

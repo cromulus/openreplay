@@ -3,7 +3,6 @@ import logging
 import secrets
 from typing import Optional
 
-import schemas
 from cachetools import TTLCache, cached
 from decouple import config
 from fastapi import BackgroundTasks, HTTPException
@@ -11,7 +10,9 @@ from psycopg2.extras import Json
 from pydantic import BaseModel, model_validator
 from starlette import status
 
+import schemas
 from chalicelib.core import authorizers, roles, spot, tenants
+from chalicelib.core.mcp import authorizers as mcp_authorizers
 from chalicelib.utils import email_helper, helper, pg_client
 from chalicelib.utils.TimeUTC import TimeUTC
 
@@ -24,14 +25,14 @@ def __generate_invitation_token():
 
 
 def create_new_member(
-    tenant_id,
-    email,
-    invitation_token,
-    admin,
-    name,
-    owner=False,
-    role_id=None,
-    modules=[],
+        tenant_id,
+        email,
+        invitation_token,
+        admin,
+        name,
+        owner=False,
+        role_id=None,
+        modules=[],
 ):
     with pg_client.PostgresClient() as cur:
         query = cur.mogrify(
@@ -85,15 +86,15 @@ def create_new_member(
 
 
 def restore_member(
-    tenant_id,
-    user_id,
-    email,
-    invitation_token,
-    admin,
-    name,
-    owner=False,
-    role_id=None,
-    modules=[],
+        tenant_id,
+        user_id,
+        email,
+        invitation_token,
+        admin,
+        name,
+        owner=False,
+        role_id=None,
+        modules=[],
 ):
     with pg_client.PostgresClient() as cur:
         query = cur.mogrify(
@@ -176,9 +177,11 @@ def reset_member(tenant_id, editor_id, user_id_to_update):
     admin = get_user(tenant_id=tenant_id, user_id=editor_id)
     if not admin["admin"] and not admin["superAdmin"]:
         return {"errors": ["unauthorized"]}
-    user = get_user(tenant_id=tenant_id, user_id=user_id_to_update)
+    user = get_member(tenant_id=tenant_id, user_id=user_id_to_update)
     if not user:
         return {"errors": ["user not found"]}
+    if user["superAdmin"] or user["joined"]:
+        return {"errors": ["unauthorized"]}
     return {"data": {"invitationLink": generate_new_invitation(user_id_to_update)}}
 
 
@@ -210,7 +213,7 @@ def update(tenant_id, user_id, changes, output=True):
                                                 (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name = 'Member' LIMIT 1),
                                                 (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name != 'Owner' LIMIT 1)))""")
             elif (
-                key == "data"
+                    key == "data"
             ):  # this is hardcoded, maybe a generic solution would be better
                 sub_query_users.append(f"data = data || %({(key)})s")
             else:
@@ -244,10 +247,10 @@ def update(tenant_id, user_id, changes, output=True):
 
 
 def create_member(
-    tenant_id,
-    user_id,
-    data: schemas.CreateMemberSchema,
-    background_tasks: BackgroundTasks,
+        tenant_id,
+        user_id,
+        data: schemas.CreateMemberSchema,
+        background_tasks: BackgroundTasks,
 ):
     admin = get_user(tenant_id=tenant_id, user_id=user_id)
     if not admin["admin"] and not admin["superAdmin"]:
@@ -276,6 +279,7 @@ def create_member(
     modules = []
     if tenants.has_service_account(tenant_id=tenant_id):
         modules = ["usability-tests", "feature-flags", "replay-export"]
+    new_member = None
     if user is not None and user["tenantId"] == tenant_id:
         new_member = restore_member(
             tenant_id=tenant_id,
@@ -288,17 +292,9 @@ def create_member(
             modules=modules,
         )
     elif user is not None:
-        __hard_delete_user(user_id=user["userId"])
-        new_member = create_new_member(
-            tenant_id=tenant_id,
-            email=data.email,
-            invitation_token=invitation_token,
-            admin=data.admin,
-            name=data.name,
-            role_id=role_id,
-            modules=modules,
-        )
-    else:
+        __rename_deleted_user(user_id=user["userId"], email=data.email)
+
+    if new_member is None:
         new_member = create_new_member(
             tenant_id=tenant_id,
             email=data.email,
@@ -381,7 +377,7 @@ def get_user(user_id, tenant_id):
         result = helper.dict_to_camel_case(r)
         if result and isinstance(result, dict):
             if result.get("settings") is None or not isinstance(
-                result.get("settings"), dict
+                    result.get("settings"), dict
             ):
                 result["settings"] = {}
             if not result["settings"].get("modules"):
@@ -426,9 +422,9 @@ def __get_account_info(tenant_id, user_id):
 
 def edit_account(user_id, tenant_id, changes: schemas.EditAccountSchema):
     if (
-        changes.opt_out is not None
-        or changes.tenantName is not None
-        and len(changes.tenantName) > 0
+            changes.opt_out is not None
+            or changes.tenantName is not None
+            and len(changes.tenantName) > 0
     ):
         user = get_user(user_id=user_id, tenant_id=tenant_id)
         if not user["superAdmin"] and not user["admin"]:
@@ -450,7 +446,7 @@ def edit_account(user_id, tenant_id, changes: schemas.EditAccountSchema):
 
 
 def edit_member(
-    user_id_to_update, tenant_id, changes: schemas.EditMemberSchema, editor_id
+        user_id_to_update, tenant_id, changes: schemas.EditMemberSchema, editor_id
 ):
     user = get_member(user_id=user_id_to_update, tenant_id=tenant_id)
     _changes = {}
@@ -560,8 +556,9 @@ def get_member(tenant_id, user_id):
         u = helper.dict_to_camel_case(cur.fetchone())
         if u:
             u["createdAt"] = TimeUTC.datetime_to_timestamp(u["createdAt"])
-            if u["invitationToken"]:
-                u["invitationLink"] = __get_invitation_link(u.pop("invitationToken"))
+            invitation_token = u.pop("invitationToken")
+            if invitation_token and not u["joined"]:
+                u["invitationLink"] = __get_invitation_link(invitation_token)
             else:
                 u["invitationLink"] = None
 
@@ -602,10 +599,9 @@ def get_members(tenant_id):
             r = helper.list_to_camel_case(r)
             for u in r:
                 u["createdAt"] = TimeUTC.datetime_to_timestamp(u["createdAt"])
-                if u["invitationToken"]:
-                    u["invitationLink"] = __get_invitation_link(
-                        u.pop("invitationToken")
-                    )
+                invitation_token = u.pop("invitationToken")
+                if invitation_token and not u["joined"]:
+                    u["invitationLink"] = __get_invitation_link(invitation_token)
                 else:
                     u["invitationLink"] = None
             return r
@@ -646,7 +642,7 @@ def transfer_ownership(tenant_id, user_id, new_owner_id):
                    FROM public.users
                    WHERE user_id = %(user_id)s
                      AND tenant_id = %(tenant_id)s
-                   FOR UPDATE;""",
+                       FOR UPDATE;""",
                 {"user_id": new_owner_id, "tenant_id": tenant_id},
             )
         )
@@ -657,7 +653,7 @@ def transfer_ownership(tenant_id, user_id, new_owner_id):
         cur.execute(
             cur.mogrify(
                 """UPDATE public.users
-                   SET role = 'admin',
+                   SET role    = 'admin',
                        role_id = %(admin_role_id)s
                    WHERE user_id = %(current_owner_id)s
                      AND role = 'owner'
@@ -675,7 +671,7 @@ def transfer_ownership(tenant_id, user_id, new_owner_id):
         cur.execute(
             cur.mogrify(
                 """UPDATE public.users
-                   SET role = 'owner',
+                   SET role    = 'owner',
                        role_id = %(owner_role_id)s
                    WHERE user_id = %(new_owner_id)s
                      AND role != 'owner'
@@ -692,7 +688,7 @@ def transfer_ownership(tenant_id, user_id, new_owner_id):
             cur.execute(
                 cur.mogrify(
                     """UPDATE public.users
-                       SET role = 'owner',
+                       SET role    = 'owner',
                            role_id = %(owner_role_id)s
                        WHERE user_id = %(current_owner_id)s
                          AND tenant_id = %(tenant_id)s
@@ -762,10 +758,10 @@ def change_password(tenant_id, user_id, email, old_password, new_password):
     if item is None:
         return {"errors": ["access denied"]}
     if (
-        item["origin"] is not None
-        and config("enforce_SSO", cast=bool, default=False)
-        and not item["superAdmin"]
-        and helper.is_saml2_available()
+            item["origin"] is not None
+            and config("enforce_SSO", cast=bool, default=False)
+            and not item["superAdmin"]
+            and helper.is_saml2_available()
     ):
         return {
             "errors": ["Please use your SSO to change your password, enforced by admin"]
@@ -783,6 +779,7 @@ def change_password(tenant_id, user_id, email, old_password, new_password):
         return {"errors": ["wrong password"]}
     changes = {"password": new_password}
     user = update(tenant_id=tenant_id, user_id=user_id, changes=changes)
+    mcp_authorizers.logout(user_id=user_id)
     r = authenticate(user["email"], new_password)
 
     return {
@@ -800,7 +797,7 @@ def set_password_invitation(tenant_id, user_id, new_password):
     changes = {"password": new_password}
     user = update(tenant_id=tenant_id, user_id=user_id, changes=changes)
     r = authenticate(user["email"], new_password)
-
+    mcp_authorizers.logout(user_id=user_id)
     return {
         "jwt": r.pop("jwt"),
         "refreshToken": r.pop("refreshToken"),
@@ -863,7 +860,7 @@ def get_by_invitation_token(token, pass_token=None):
     return helper.dict_to_camel_case(r)
 
 
-def auth_exists(user_id, tenant_id, jwt_iat) -> bool:
+def auth_exists(user_id, tenant_id, jwt_iat, skip_iat: bool = False) -> bool:
     with pg_client.PostgresClient() as cur:
         cur.execute(
             cur.mogrify(
@@ -881,10 +878,11 @@ def auth_exists(user_id, tenant_id, jwt_iat) -> bool:
         )
         r = cur.fetchone()
     return r is not None and (
-        r["service_account"]
-        and not r["has_basic_auth"]
-        or r.get("jwt_iat") is not None
-        and (abs(jwt_iat - r["jwt_iat"]) <= 1)
+            skip_iat or
+            r["service_account"]
+            and not r["has_basic_auth"]
+            or r.get("jwt_iat") is not None
+            and (abs(jwt_iat - r["jwt_iat"]) <= 1)
     )
 
 
@@ -1030,8 +1028,8 @@ def authenticate(email, password, for_change_password=False) -> dict | bool | No
                 detail="service account is not authorized to login",
             )
         elif (
-            config("enforce_SSO", cast=bool, default=False)
-            and helper.is_saml2_available()
+                config("enforce_SSO", cast=bool, default=False)
+                and helper.is_saml2_available()
         ):
             return {"errors": ["must sign-in with SSO, enforced by admin"]}
 
@@ -1100,19 +1098,20 @@ def get_user_role(tenant_id, user_id):
 
 def create_sso_user(tenant_id, email, admin, name, origin, role_id, internal_id=None):
     with pg_client.PostgresClient() as cur:
+        # @formatter:off
         query = cur.mogrify(
             """ \
             WITH u AS (
-            INSERT
-            INTO public.users (tenant_id, email, role, name, data, origin, internal_id, role_id)
-            VALUES (%(tenant_id)s, %(email)s, %(role)s, %(name)s, %(data)s, %(origin)s, %(internal_id)s, (SELECT COALESCE ((SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND role_id = %(role_id)s), (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name = 'Member' LIMIT 1), (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name != 'Owner' LIMIT 1))))
-                RETURNING *
-                ), au AS (
-            INSERT
-            INTO public.basic_authentication(user_id)
-            VALUES ((SELECT user_id FROM u))
-                )
-            SELECT u.user_id                                              AS id,
+                INSERT INTO public.users (tenant_id, email, role, name, data, origin, internal_id, role_id)
+                VALUES (%(tenant_id)s, %(email)s, %(role)s, %(name)s, %(data)s, %(origin)s, %(internal_id)s, 
+                    (SELECT COALESCE ((SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND role_id = %(role_id)s), 
+                                      (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name = 'Member' LIMIT 1), 
+                                      (SELECT role_id FROM roles WHERE tenant_id = %(tenant_id)s AND name != 'Owner' LIMIT 1))))
+                RETURNING *), 
+            au AS (
+                INSERT INTO public.basic_authentication(user_id)
+                VALUES ((SELECT user_id FROM u)))
+            SELECT u.user_id AS id,
                    u.email,
                    u.role,
                    u.name,
@@ -1121,6 +1120,7 @@ def create_sso_user(tenant_id, email, admin, name, origin, role_id, internal_id=
                    (CASE WHEN u.role = 'member' THEN TRUE ELSE FALSE END) AS member,
                    origin
             FROM u;""",
+            # @formatter:on
             {
                 "tenant_id": tenant_id,
                 "email": email,
@@ -1136,14 +1136,28 @@ def create_sso_user(tenant_id, email, admin, name, origin, role_id, internal_id=
         return helper.dict_to_camel_case(cur.fetchone())
 
 
-def __hard_delete_user(user_id):
+def __rename_deleted_user(user_id, email):
     with pg_client.PostgresClient() as cur:
         query = cur.mogrify(
-            """DELETE
+            """SELECT COUNT(1) AS c
                FROM public.users
+               WHERE email ILIKE %(email)s
+                 AND users.deleted_at IS NOT NULL;""",
+            {"email": f"deleted%_{email}"},
+        )
+        cur.execute(query)
+        row = cur.fetchone()
+        email_prefix = 'deleted'
+        if row is not None:
+            row = row["c"]
+            email_prefix = f"deleted{row}"
+        email_prefix += "_"
+        query = cur.mogrify(
+            """UPDATE public.users
+               SET email=%(email_prefix)s || email
                WHERE users.user_id = %(user_id)s
                  AND users.deleted_at IS NOT NULL;""",
-            {"user_id": user_id},
+            {"user_id": user_id, "email_prefix": email_prefix},
         )
         cur.execute(query)
 
@@ -1178,14 +1192,14 @@ def refresh(user_id: int, tenant_id: int = -1) -> dict:
             jwt_jti=j.jwt_refresh_jti,
         ),
         "refreshTokenMaxAge": config("JWT_REFRESH_EXPIRATION", cast=int)
-        - (j.jwt_iat - j.jwt_refresh_iat),
+                              - (j.jwt_iat - j.jwt_refresh_iat),
     }
 
 
 def authenticate_sso(email: str, internal_id: str):
     with pg_client.PostgresClient() as cur:
         query = cur.mogrify(
-            """SELECT users.user_id,
+            f"""SELECT users.user_id,
                       users.tenant_id,
                       users.role,
                       users.name,
@@ -1196,9 +1210,8 @@ def authenticate_sso(email: str, internal_id: str):
                       role_id,
                       service_account
                FROM public.users AS users
-               WHERE users.email = %(email)s
-                 AND internal_id = %(internal_id)s;""",
-            {"email": email, "internal_id": internal_id},
+               WHERE users.email = %(email)s;""",
+            {"email": email},
         )
 
         cur.execute(query)
@@ -1245,14 +1258,12 @@ def authenticate_sso(email: str, internal_id: str):
             "spotRefreshTokenMaxAge": config("JWT_SPOT_REFRESH_EXPIRATION", cast=int),
         }
         return response
-    logger.warning(
-        f"SSO user not found with email: {email} and internal_id: {internal_id}"
-    )
+    logger.warning(f"SSO user not found with email: {email} and internal_id: {internal_id}")
     return None
 
 
 def restore_sso_user(
-    user_id, tenant_id, email, admin, name, origin, role_id, internal_id=None
+        user_id, tenant_id, email, admin, name, origin, role_id, internal_id=None
 ):
     with pg_client.PostgresClient() as cur:
         query = cur.mogrify(

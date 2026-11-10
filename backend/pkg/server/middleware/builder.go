@@ -6,6 +6,7 @@ import (
 	"openreplay/backend/pkg/spot/keys"
 
 	ctxStore "github.com/docker/distribution/context"
+	"github.com/klauspost/compress/gzhttp"
 
 	"openreplay/backend/internal/config/common"
 	"openreplay/backend/internal/http/util"
@@ -44,6 +45,10 @@ func NewMiddlewareBuilder(
 	extensionSecret *string,
 	keys keys.Keys,
 ) (api.MiddlewareBuilder, error) {
+	compression, err := NewCompression()
+	if err != nil {
+		return nil, fmt.Errorf("error creating compression middleware: %s", err)
+	}
 	healthCheck := NewHealthCheck()
 	corsCheck := NewCors(http.UseAccessControlHeaders)
 	authenticator, err := auth.NewAuth(log, jwtSecret, user.New(pgPool, user.MCPConfig{
@@ -66,14 +71,44 @@ func NewMiddlewareBuilder(
 		return nil, fmt.Errorf("error creating auditrail middleware: %s", err)
 	}
 	return &baseMiddlewareBuilderImpl{
-		middlewares: []api.RouterMiddleware{healthCheck, corsCheck, authenticator, perms, rateLimiter, audiTrail},
+		middlewares: []api.RouterMiddleware{NewSecurityHeaders(), compression, healthCheck, corsCheck, authenticator, perms, rateLimiter, audiTrail},
 	}, nil
 }
 
 func NewMinimalMiddlewareBuilder(http *common.HTTP) (api.MiddlewareBuilder, error) {
 	return &baseMiddlewareBuilderImpl{
-		middlewares: []api.RouterMiddleware{NewHealthCheck(), NewCors(http.UseAccessControlHeaders)},
+		middlewares: []api.RouterMiddleware{NewSecurityHeaders(), NewHealthCheck(), NewCors(http.UseAccessControlHeaders)},
 	}, nil
+}
+
+type compressionImpl struct {
+	wrapper func(http.Handler) http.HandlerFunc
+}
+
+func NewCompression() (api.RouterMiddleware, error) {
+	wrapper, err := gzhttp.NewWrapper(gzhttp.ContentTypes([]string{"application/json"}))
+	if err != nil {
+		return nil, err
+	}
+	return &compressionImpl{wrapper: wrapper}, nil
+}
+
+func (b *compressionImpl) Middleware(next http.Handler) http.Handler {
+	return b.wrapper(next)
+}
+
+type securityHeadersImpl struct{}
+
+func NewSecurityHeaders() api.RouterMiddleware {
+	return &securityHeadersImpl{}
+}
+
+func (b *securityHeadersImpl) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
 }
 
 type healthCheckImpl struct{}
@@ -109,7 +144,7 @@ func (b *corsImpl) Middleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,Content-Encoding,datatype")
 		}
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Cache-Control", "max-age=86400")
+			w.Header().Set("Access-Control-Max-Age", "3600")
 			w.WriteHeader(http.StatusOK)
 			return
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	config "openreplay/backend/internal/config/api"
 	"openreplay/backend/pkg/analytics/events"
@@ -12,7 +13,7 @@ import (
 	"openreplay/backend/pkg/analytics/filters"
 	"openreplay/backend/pkg/analytics/users"
 	usersModel "openreplay/backend/pkg/analytics/users/model"
-	"openreplay/backend/pkg/assist/proxy"
+	"openreplay/backend/pkg/assist"
 	"openreplay/backend/pkg/jobs"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/projects"
@@ -27,12 +28,12 @@ type handlersImpl struct {
 	users    users.Users
 	events   events.Events
 	jobs     jobs.Jobs
-	assist   proxy.Assist
+	assist   assist.Assist
 	cfg      *config.Config
 	handlers []*api.Description
 }
 
-func NewHandlers(log logger.Logger, req api.RequestHandler, projects projects.Projects, users users.Users, events events.Events, jobsService jobs.Jobs, assist proxy.Assist, cfg *config.Config) (api.Handlers, error) {
+func NewHandlers(log logger.Logger, req api.RequestHandler, projects projects.Projects, users users.Users, events events.Events, jobsService jobs.Jobs, assist assist.Assist, cfg *config.Config) (api.Handlers, error) {
 	h := &handlersImpl{
 		log:      log,
 		projects: projects,
@@ -258,15 +259,12 @@ func (h *handlersImpl) searchEventsBySession(r *api.RequestContext) (any, int, e
 		return nil, statusCode, err
 	}
 
-	sessionID, err := api.GetPathParam(r.Request, "sessionID", api.ParseString)
+	sessionID, err := api.GetPathParam(r.Request, "sessionID", api.ParseUint64)
 	if err != nil {
-		return nil, http.StatusBadRequest, err
+		return nil, http.StatusBadRequest, fmt.Errorf("sessionID must be a positive integer")
 	}
-	if sessionID == "" {
-		return nil, http.StatusBadRequest, fmt.Errorf("sessionID cannot be empty")
-	}
-	if len(sessionID) > 256 {
-		return nil, http.StatusBadRequest, fmt.Errorf("sessionID exceeds maximum length of 256 characters")
+	if sessionID == 0 {
+		return nil, http.StatusBadRequest, fmt.Errorf("sessionID cannot be zero")
 	}
 
 	req := &eventsModel.EventsSearchRequest{}
@@ -277,7 +275,7 @@ func (h *handlersImpl) searchEventsBySession(r *api.RequestContext) (any, int, e
 	req.Filters = append(req.Filters, filters.Filter{
 		Name:     "session_id",
 		Operator: "is",
-		Value:    []string{sessionID},
+		Value:    []string{strconv.FormatUint(sessionID, 10)},
 	})
 
 	if err := filters.ValidateStruct(req); err != nil {

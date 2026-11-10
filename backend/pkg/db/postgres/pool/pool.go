@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"openreplay/backend/pkg/metrics/database"
 )
@@ -19,6 +20,7 @@ type Pool interface {
 	Query(sql string, args ...interface{}) (pgx.Rows, error)
 	QueryRow(sql string, args ...interface{}) pgx.Row
 	Exec(sql string, arguments ...interface{}) error
+	ExecContext(ctx context.Context, sql string, arguments ...interface{}) error
 	SendBatch(b *pgx.Batch) pgx.BatchResults
 	Begin() (*Tx, error)
 	Ping(ctx context.Context) error
@@ -35,9 +37,14 @@ func New(metrics database.Database, url string) (Pool, error) {
 	if url == "" {
 		return nil, errors.New("pg connection url is empty")
 	}
-	conn, err := pgxpool.Connect(context.Background(), url)
+	cfg, err := pgxpool.ParseConfig(escapeUserinfo(url))
 	if err != nil {
-		return nil, fmt.Errorf("pgxpool.Connect error: %v", err)
+		return nil, fmt.Errorf("pgxpool.ParseConfig error: %v", err)
+	}
+	cfg.AfterConnect = registerCustomTypes
+	conn, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("pgxpool.NewWithConfig error: %v", err)
 	}
 	res := &poolImpl{
 		url:     url,
@@ -86,6 +93,15 @@ func (p *poolImpl) Exec(sql string, arguments ...interface{}) error {
 	return err
 }
 
+func (p *poolImpl) ExecContext(ctx context.Context, sql string, arguments ...interface{}) error {
+	start := time.Now()
+	_, err := p.conn.Exec(ctx, sql, arguments...)
+	method, table := methodName(sql)
+	p.metrics.RecordRequestDuration(float64(time.Now().Sub(start).Milliseconds()), method, table)
+	p.metrics.IncreaseTotalRequests(method, table)
+	return err
+}
+
 func (p *poolImpl) SendBatch(b *pgx.Batch) pgx.BatchResults {
 	start := time.Now()
 	res := p.conn.SendBatch(getTimeoutContext(), b)
@@ -111,6 +127,31 @@ func (p *poolImpl) Ping(ctx context.Context) error {
 
 func (p *poolImpl) Close() {
 	p.conn.Close()
+}
+
+var customTypes = []string{"issue_type", "_issue_type"}
+
+func registerCustomTypes(ctx context.Context, conn *pgx.Conn) error {
+	for _, name := range customTypes {
+		t, err := conn.LoadType(ctx, name)
+		if err != nil {
+			continue
+		}
+		conn.TypeMap().RegisterType(t)
+	}
+	return nil
+}
+
+// pgx >= 5.11 splits URL userinfo at the first '@' (like libpq), so a raw '@' in the password breaks the host.
+func escapeUserinfo(connString string) string {
+	if !strings.HasPrefix(connString, "postgres://") && !strings.HasPrefix(connString, "postgresql://") {
+		return connString
+	}
+	u, err := url.Parse(connString)
+	if err != nil {
+		return connString
+	}
+	return u.String()
 }
 
 // TX - start

@@ -1,6 +1,7 @@
 package charts
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -60,5 +61,144 @@ func TestStringValueStillEscaped(t *testing.T) {
 	}
 	if !strings.Contains(got, "'1 OR 1=1'") {
 		t.Errorf("expected quoted literal, got: %s", got)
+	}
+}
+
+func TestMetadataNameNotInjectable(t *testing.T) {
+	inject := []struct {
+		name string
+		f    model.Filter
+	}{
+		{"isAny-or", model.Filter{
+			Name:     "metadata_2) OR ((SELECT user_id FROM experimental.sessions LIMIT 1)='x'",
+			Operator: "isAny",
+		}},
+		{"isAny-break", model.Filter{
+			Name:     "metadata_1))) POC_SYNTAX_BREAK (((",
+			Operator: "isAny",
+		}},
+		{"is-value-expr", model.Filter{
+			Name:     "metadata_2) OR 1=1 --",
+			Operator: "is",
+			Value:    []string{"x"},
+		}},
+		{"contains-expr", model.Filter{
+			Name:     "metadata_1) OR 1=1 --",
+			Operator: "contains",
+			Value:    []string{"x"},
+		}},
+		{"trailing-index", model.Filter{
+			Name:     "metadata_11 OR 1=1",
+			Operator: "isAny",
+		}},
+	}
+	for _, c := range inject {
+		got := buildOne(t, c.f)
+		// Payloads that don't match the metadata allowlist must never reach the
+		// SQL expression position. They may only appear (inert) inside quoted
+		// string literals, so strip those before checking for injected tokens.
+		bare := stripSQLLiterals(got)
+		if strings.Contains(bare, "OR ") || strings.Contains(bare, "SELECT") ||
+			strings.Contains(bare, "((") || strings.Contains(bare, "--") {
+			t.Errorf("%s: metadata name injection survived: %s", c.name, got)
+		}
+	}
+}
+
+// stripSQLLiterals removes single-quoted string literals so tests can assert
+// that attacker-controlled text never lands in unquoted expression position.
+func stripSQLLiterals(s string) string {
+	var b strings.Builder
+	inLit := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' {
+			// collapse doubled '' escapes inside a literal
+			if inLit && i+1 < len(s) && s[i+1] == '\'' {
+				i++
+				continue
+			}
+			inLit = !inLit
+			continue
+		}
+		if !inLit {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+func TestLegitimateMetadataPreserved(t *testing.T) {
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("metadata_%d", i)
+		got := buildOne(t, model.Filter{Name: name, Operator: "isAny"})
+		if !strings.Contains(got, fmt.Sprintf("isNotNull(%s)", name)) {
+			t.Errorf("%s: valid metadata column wrongly dropped: %s", name, got)
+		}
+	}
+	got := buildOne(t, model.Filter{Name: "metadata_3", Operator: "is", Value: []string{"prod"}})
+	if !strings.Contains(got, "metadata_3 = 'prod'") {
+		t.Errorf("valid metadata equals not built: %s", got)
+	}
+}
+
+func TestIsMetadataColumn(t *testing.T) {
+	valid := []string{"metadata_1", "metadata_9", "metadata_10"}
+	for _, n := range valid {
+		if !IsMetadataColumn(n) {
+			t.Errorf("expected %q to be a valid metadata column", n)
+		}
+	}
+	invalid := []string{
+		"metadata_0", "metadata_11", "metadata_", "metadata_1a",
+		"metadata_2) OR 1=1", "metadata_1 ", " metadata_1", "Metadata_1",
+		"metadata_01", "metadata_1;drop",
+	}
+	for _, n := range invalid {
+		if IsMetadataColumn(n) {
+			t.Errorf("expected %q to be rejected", n)
+		}
+	}
+}
+
+func TestUserJourneyMetricValueRejected(t *testing.T) {
+	h := &UserJourneyQueryBuilder{}
+	payload := &model.MetricPayload{
+		StartTimestamp: 1704067200000,
+		EndTimestamp:   1704153600000,
+		Density:        2,
+		MetricValue:    []string{"x' OR 1=1 OR '", "click"},
+		Series:         []model.Series{{Name: "s1", Filter: model.FilterGroup{}}},
+	}
+	p := &Payload{MetricPayload: payload, ProjectId: 1, UserId: 1}
+
+	// Only the predefined journey types are accepted; anything else is rejected
+	// before reaching SQL expression position.
+	queries, err := h.buildQuery(p)
+	if err == nil {
+		t.Fatalf("expected unsupported metricValue to be rejected, got queries:\n%s", strings.Join(queries, "\n"))
+	}
+}
+
+func TestUserJourneyExcludeValueNotInjectable(t *testing.T) {
+	h := &UserJourneyQueryBuilder{}
+	mal := "y' OR 1=1 OR '"
+	payload := &model.MetricPayload{
+		StartTimestamp: 1704067200000,
+		EndTimestamp:   1704153600000,
+		Density:        2,
+		MetricValue:    []string{"location"},
+		Exclude:        []model.Filter{{Name: "location", Operator: "is", Value: []string{mal}}},
+		Series:         []model.Series{{Name: "s1", Filter: model.FilterGroup{}}},
+	}
+	p := &Payload{MetricPayload: payload, ProjectId: 1, UserId: 1}
+
+	queries, err := h.buildQuery(p)
+	if err != nil {
+		t.Fatalf("buildQuery error: %v", err)
+	}
+	// The malicious exclude value may only appear inside a quoted literal (escaped).
+	bare := stripSQLLiterals(strings.Join(queries, "\n"))
+	if strings.Contains(bare, "OR 1=1") {
+		t.Errorf("user-journey Exclude.Value injection survived:\n%s", strings.Join(queries, "\n"))
 	}
 }

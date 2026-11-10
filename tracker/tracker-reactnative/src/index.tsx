@@ -1,10 +1,13 @@
+import * as React from 'react';
 import {
   NativeModules,
   Platform,
   requireNativeComponent,
+  StyleSheet,
   TurboModuleRegistry,
   type TextInputProps,
   UIManager,
+  View,
   type ViewProps,
 } from 'react-native';
 import type { TurboModule } from 'react-native';
@@ -63,42 +66,147 @@ const ORTrackerConnector: IORTrackerConnector =
   TurboModuleRegistry.get<IORTrackerConnector>('ORTrackerConnector') ??
   NativeModules.ORTrackerConnector;
 
-const RnTrackerTouchTrackingView =
-  UIManager.getViewManagerConfig('RnTrackerTouchView') != null
-    ? requireNativeComponent<ViewProps>('RnTrackerTouchView')
-    : () => {
-        throw new Error('RnTrackerTouchView; ' + LINKING_ERROR);
-      };
-
-interface ORTrackedInputProps extends TextInputProps {
-  trackingLabel?: string;
+/**
+ * Whether a native view manager is registered.
+ *
+ * `getViewManagerConfig` is the only probe that works on the old architecture,
+ * but on bridgeless it needs the native ViewConfig interop layer
+ * (`useNativeViewConfigsInBridgelessMode`, off by default) and otherwise logs a
+ * soft error and returns `null`. `hasViewManagerConfig` is the bridgeless
+ * answer, but it throws when the component registry global is missing. Try the
+ * bridgeless probe first, fall back to the paper one, and treat a throw from
+ * both as "not registered" rather than letting it escape at import time.
+ */
+function hasNativeComponent(name: string): boolean {
+  try {
+    if (typeof UIManager.hasViewManagerConfig === 'function') {
+      return UIManager.hasViewManagerConfig(name);
+    }
+  } catch {
+    // registry global not installed - fall through to the paper probe
+  }
+  try {
+    return UIManager.getViewManagerConfig(name) != null;
+  } catch {
+    return false;
+  }
 }
 
-const ORTrackedInput =
-  UIManager.getViewManagerConfig('RnTrackedInput') != null
-    ? requireNativeComponent<ORTrackedInputProps>('RnTrackedInput')
-    : () => {
-        throw new Error('RnTrackedInput; ' + LINKING_ERROR);
-      };
+const RnTrackerTouchTrackingView = hasNativeComponent('RnTrackerTouchView')
+  ? requireNativeComponent<ViewProps>('RnTrackerTouchView')
+  : () => {
+      throw new Error('RnTrackerTouchView; ' + LINKING_ERROR);
+    };
 
-const ORSanitizedView =
-  UIManager.getViewManagerConfig('RnSanitizedView') != null
-    ? requireNativeComponent<ViewProps>('RnSanitizedView')
-    : () => {
-        throw new Error('RnSanitizedView; ' + LINKING_ERROR);
-      };
+/**
+ * Only `trackingLabel` and `placeholder` reach the native input - it is a plain
+ * `EditText`/`UITextField`, not a `TextInput`, so no other `TextInputProps`
+ * (`value`, `onChangeText`, `secureTextEntry`, ...) are wired up.
+ */
+interface ORTrackedInputProps extends ViewProps {
+  /**
+   * Label reported with the input event.
+   *
+   * Android only - the iOS SDK derives the label from `placeholder`. Set
+   * `placeholder` for a label on both platforms.
+   */
+  trackingLabel?: string;
+  placeholder?: TextInputProps['placeholder'];
+}
+
+const ORTrackedInput = hasNativeComponent('RnTrackedInput')
+  ? requireNativeComponent<ORTrackedInputProps>('RnTrackedInput')
+  : () => {
+      throw new Error('RnTrackedInput; ' + LINKING_ERROR);
+    };
+
+const RnSanitizedMarker = hasNativeComponent('RnSanitizedView')
+  ? requireNativeComponent<ViewProps>('RnSanitizedView')
+  : null;
+
+/**
+ * Marks its subtree as sensitive so it gets masked in the replay.
+ *
+ * The native view is rendered as an invisible, absolutely positioned sibling
+ * *behind* the children instead of as their parent, and the wrapper is marked
+ * `collapsable={false}`.
+ *
+ * `RnSanitizedView` is a legacy (paper) ViewManager, so on the new architecture
+ * RN mounts it through the Fabric interop layer. When one interop view ends up
+ * as the direct view-child of another interop view,
+ * `RCTLegacyViewManagerInteropComponentView` re-parents the inner paper view
+ * into the outer paper view, while the inner view's frame keeps being driven by
+ * `layoutMetrics.getContentFrame()` - origin (0, 0) of the outer region, size
+ * shrunk by the inner content insets. Everything inside the inner region is
+ * then drawn at the wrong offset and with the wrong width. Fabric flattens
+ * layout-only `View`s, so an intermediate plain `View` is not enough to keep the
+ * two native views apart - hence a childless native view (never an interop
+ * parent) plus a non-collapsable wrapper (never flattened away).
+ */
+const ORSanitizedView = React.forwardRef<View, ViewProps>(
+  ({ children, ...rest }, ref) => {
+    if (RnSanitizedMarker == null) {
+      throw new Error('RnSanitizedView; ' + LINKING_ERROR);
+    }
+    return (
+      <View ref={ref} collapsable={false} {...rest}>
+        <RnSanitizedMarker style={styles.marker} pointerEvents="none" />
+        {children}
+      </View>
+    );
+  }
+);
+ORSanitizedView.displayName = 'ORSanitizedView';
+
+// Spelled out instead of `StyleSheet.absoluteFillObject`, which RN removed in
+// 0.85 - it silently became `undefined` there, leaving the marker unpositioned.
+const styles = StyleSheet.create({
+  marker: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+  },
+});
 
 interface ORTrackedViewProps extends ViewProps {
   screenName: string;
   viewName: string;
 }
 
-const ORTrackedView =
-  UIManager.getViewManagerConfig('RnTrackerView') != null
-    ? requireNativeComponent<ORTrackedViewProps>('RnTrackerView')
-    : () => {
-        throw new Error('RnTrackerView; ' + LINKING_ERROR);
-      };
+const RnTrackedViewMarker = hasNativeComponent('RnTrackerView')
+  ? requireNativeComponent<Omit<ORTrackedViewProps, 'children'>>(
+      'RnTrackerView'
+    )
+  : null;
+
+/**
+ * Reports its region to the tracker as a named, observable view.
+ *
+ * Rendered the same way as {@link ORSanitizedView} - a childless native marker
+ * behind the children instead of around them - because it hits the same Fabric
+ * interop layout bug. See the note on `ORSanitizedView`.
+ */
+const ORTrackedView = React.forwardRef<View, ORTrackedViewProps>(
+  ({ children, screenName, viewName, ...rest }, ref) => {
+    if (RnTrackedViewMarker == null) {
+      throw new Error('RnTrackerView; ' + LINKING_ERROR);
+    }
+    return (
+      <View ref={ref} collapsable={false} {...rest}>
+        <RnTrackedViewMarker
+          screenName={screenName}
+          viewName={viewName}
+          style={styles.marker}
+          pointerEvents="none"
+        />
+        {children}
+      </View>
+    );
+  }
+);
+ORTrackedView.displayName = 'ORTrackedView';
 
 export function setMetadata(key: string, value: string) {
   ORTrackerConnector.setMetadata(key, value);

@@ -10,14 +10,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	gzip "github.com/klauspost/pgzip"
 
 	config "openreplay/backend/internal/config/images"
+	"openreplay/backend/pkg/cleanup/registry"
+	"openreplay/backend/pkg/frames"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/queue/types"
 	"openreplay/backend/pkg/server/api"
@@ -26,22 +25,24 @@ import (
 )
 
 type handlersImpl struct {
-	log       logger.Logger
-	cfg       *config.Config
-	responser api.Responser
-	tokenizer *token.Tokenizer
-	sessions  sessions.Sessions
-	producer  types.Producer
+	log        logger.Logger
+	cfg        *config.Config
+	responser  api.Responser
+	tokenizer  *token.Tokenizer
+	sessions   sessions.Sessions
+	producer   types.Producer
+	cleanupReg registry.Registry
 }
 
-func NewHandlers(cfg *config.Config, log logger.Logger, responser api.Responser, tokenizer *token.Tokenizer, sessions sessions.Sessions, producer types.Producer) (api.Handlers, error) {
+func NewHandlers(cfg *config.Config, log logger.Logger, responser api.Responser, tokenizer *token.Tokenizer, sessions sessions.Sessions, producer types.Producer, cleanupReg registry.Registry) (api.Handlers, error) {
 	return &handlersImpl{
-		log:       log,
-		cfg:       cfg,
-		responser: responser,
-		tokenizer: tokenizer,
-		sessions:  sessions,
-		producer:  producer,
+		log:        log,
+		cfg:        cfg,
+		responser:  responser,
+		tokenizer:  tokenizer,
+		sessions:   sessions,
+		producer:   producer,
+		cleanupReg: cleanupReg,
 	}, nil
 }
 
@@ -49,11 +50,6 @@ func (h *handlersImpl) GetAll() []*api.Description {
 	return []*api.Description{
 		{"/v1/mobile/images", "POST", h.imagesUploaderHandlerMobile, api.NoPermissions, api.DoNotTrack},
 	}
-}
-
-type ImagesMessage struct {
-	Name string
-	Data []byte
 }
 
 func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +87,10 @@ func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *htt
 		isFrames = true
 	}
 
+	if len(r.MultipartForm.File) > 0 {
+		e.cleanupReg.Register(sessionData.ID, true, sessionData.ExpTime+registry.DeadlineGraceMs)
+	}
+
 	for _, fileHeaderList := range r.MultipartForm.File {
 		for _, fileHeader := range fileHeaderList {
 			file, err := fileHeader.Open()
@@ -113,17 +113,24 @@ func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *htt
 				return
 			}
 			defer uncompressedStream.Close()
+			unpacked, err := api.ReadLimited(uncompressedStream, e.cfg.UnpackedSizeLimit)
+			if err != nil {
+				code := http.StatusInternalServerError
+				if errors.Is(err, api.ErrBodyTooLarge) {
+					code = http.StatusRequestEntityTooLarge
+				}
+				e.responser.ResponseWithError(e.log, r.Context(), w, code, fmt.Errorf("can't unpack gzip: %w", err), startTime, r.URL.Path, 0)
+				return
+			}
 
-			frames := bytes.NewBuffer([]byte{})
+			var framesBuf *bytes.Buffer
 			var fileName string
 
 			if isFrames {
-				if _, err = frames.ReadFrom(uncompressedStream); err != nil {
-					e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, err, startTime, r.URL.Path, 0)
-					return
-				}
+				framesBuf = bytes.NewBuffer(unpacked)
 			} else {
-				tarReader := tar.NewReader(uncompressedStream)
+				framesBuf = bytes.NewBuffer(make([]byte, 0, len(unpacked)))
+				tarReader := tar.NewReader(bytes.NewReader(unpacked))
 				for {
 					header, err := tarReader.Next()
 					if err != nil {
@@ -138,7 +145,7 @@ func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *htt
 						e.log.Error(r.Context(), "ExtractTarGz: unknown type: %d in %s", header.Typeflag, header.Name)
 						continue
 					}
-					name, ts, err := parseImageName(header.Name)
+					name, ts, err := frames.ParseFrameName(header.Name)
 					if err != nil {
 						e.log.Error(r.Context(), "ExtractTarGz: can't parse time for %s: %s", header.Name, err)
 						continue
@@ -146,28 +153,28 @@ func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *htt
 					if fileName == "" {
 						fileName = name
 					}
-					prevLen := frames.Len()
-					if err := binary.Write(frames, binary.LittleEndian, ts); err != nil {
+					prevLen := framesBuf.Len()
+					if err := binary.Write(framesBuf, binary.LittleEndian, ts); err != nil {
 						e.log.Error(r.Context(), "can't write frame's time for %s: %s", header.Name, err)
-						frames.Truncate(prevLen)
+						framesBuf.Truncate(prevLen)
 						continue
 					}
-					if err := binary.Write(frames, binary.LittleEndian, uint32(header.Size)); err != nil {
+					if err := binary.Write(framesBuf, binary.LittleEndian, uint32(header.Size)); err != nil {
 						e.log.Error(r.Context(), "can't write frame's size for %s: %s", header.Name, err)
-						frames.Truncate(prevLen)
+						framesBuf.Truncate(prevLen)
 						continue
 					}
-					if _, err := frames.ReadFrom(tarReader); err != nil {
+					if _, err := framesBuf.ReadFrom(tarReader); err != nil {
 						e.log.Error(r.Context(), "can't read frame for %s: %s", header.Name, err)
-						frames.Truncate(prevLen)
+						framesBuf.Truncate(prevLen)
 						continue
 					}
 				}
 			}
 
-			packedMessage, err := json.Marshal(&ImagesMessage{
+			packedMessage, err := json.Marshal(&frames.Message{
 				Name: fileName,
-				Data: frames.Bytes(),
+				Data: framesBuf.Bytes(),
 			})
 			if err != nil {
 				e.log.Warn(r.Context(), "can't marshal screenshot message, err: %s", err)
@@ -183,20 +190,4 @@ func (e *handlersImpl) imagesUploaderHandlerMobile(w http.ResponseWriter, r *htt
 	}
 	e.log.Warn(r.Context(), "no images to upload")
 	e.responser.ResponseOK(e.log, r.Context(), w, startTime, r.URL.Path, 0)
-}
-
-func parseImageName(imageName string) (baseName string, ts uint64, err error) {
-	ext := filepath.Ext(imageName) // .jpeg
-	name := strings.TrimSuffix(imageName, ext)
-	// Last segment after '_' is the timestamp
-	idx := strings.LastIndex(name, "_")
-	if idx < 0 {
-		return "", 0, fmt.Errorf("image name has no underscore: %s", imageName)
-	}
-	baseName = name[:idx] + ext // for example "1771238515501_33.jpeg"
-	ts, err = strconv.ParseUint(name[idx+1:], 10, 64)
-	if err != nil {
-		return "", 0, fmt.Errorf("can't parse timestamp from canvas name %s: %w", imageName, err)
-	}
-	return baseName, ts, nil
 }

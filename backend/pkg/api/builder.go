@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/go-playground/validator/v10"
@@ -12,6 +13,8 @@ import (
 	"openreplay/backend/pkg/analytics/dashboards"
 	analyticsEvents "openreplay/backend/pkg/analytics/events"
 	analyticsEventsAPI "openreplay/backend/pkg/analytics/events/api"
+	filtersCatalog "openreplay/backend/pkg/analytics/filters_catalog"
+	filtersCatalogAPI "openreplay/backend/pkg/analytics/filters_catalog/api"
 	"openreplay/backend/pkg/analytics/lexicon"
 	lexiconAPI "openreplay/backend/pkg/analytics/lexicon/api"
 	"openreplay/backend/pkg/analytics/model"
@@ -20,18 +23,23 @@ import (
 	"openreplay/backend/pkg/analytics/users"
 	usersAPI "openreplay/backend/pkg/analytics/users/api"
 	"openreplay/backend/pkg/api_key"
-	"openreplay/backend/pkg/assist/proxy"
+	"openreplay/backend/pkg/assist"
 	"openreplay/backend/pkg/canvas"
 	"openreplay/backend/pkg/conditions"
 	conditionsApi "openreplay/backend/pkg/conditions/projects_api"
 	chdb "openreplay/backend/pkg/db/clickhouse"
 	"openreplay/backend/pkg/db/postgres/pool"
+	"openreplay/backend/pkg/db/redis"
 	"openreplay/backend/pkg/events"
 	eventAPI "openreplay/backend/pkg/events/api"
 	"openreplay/backend/pkg/favorite"
 	favoriteAPI "openreplay/backend/pkg/favorite/api"
+	integrationsAPI "openreplay/backend/pkg/integrations/api"
+	integrationsService "openreplay/backend/pkg/integrations/service"
 	"openreplay/backend/pkg/jobs"
 	"openreplay/backend/pkg/logger"
+	assistMetrics "openreplay/backend/pkg/metrics/assist"
+	"openreplay/backend/pkg/metrics/database"
 	"openreplay/backend/pkg/metrics/web"
 	"openreplay/backend/pkg/notes"
 	noteAPI "openreplay/backend/pkg/notes/api"
@@ -63,14 +71,37 @@ type serviceBuilder struct {
 	usersAPI           api.Handlers
 	lexiconAPI         api.Handlers
 	tagsAdminAPI       api.Handlers
+	filtersCatalogAPI  api.Handlers
+	integrationsAPI    api.Handlers
+	extraHandlers      []api.Handlers
+	workers            []Worker
+	wg                 sync.WaitGroup
 }
 
 func (b *serviceBuilder) Handlers() []api.Handlers {
-	return []api.Handlers{b.sessionAPI, b.eventAPI, b.analyticsEventsAPI, b.favoriteAPI, b.noteAPI, b.replayAPI, b.apiKeyAPI, b.conditionsAPI,
-		b.chartsAPI, b.dashboardsAPI, b.cardsAPI, b.searchAPI, b.savedSearchesAPI, b.usersAPI, b.lexiconAPI, b.tagsAdminAPI}
+	handlers := []api.Handlers{b.sessionAPI, b.eventAPI, b.filtersCatalogAPI, b.analyticsEventsAPI, b.favoriteAPI, b.noteAPI, b.replayAPI, b.apiKeyAPI, b.conditionsAPI,
+		b.chartsAPI, b.dashboardsAPI, b.cardsAPI, b.searchAPI, b.savedSearchesAPI, b.usersAPI, b.lexiconAPI, b.tagsAdminAPI, b.integrationsAPI}
+	return append(handlers, b.extraHandlers...)
 }
 
-func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web, pgconn pool.Pool, chconn clickhouse.Conn, chSessionFactory chdb.SessionFactory, objStore objectstorage.ObjectStorage, projects projects.Projects, canvases canvas.Canvases) (api.ServiceBuilder, error) {
+func (b *serviceBuilder) Run() {
+	for _, w := range b.workers {
+		b.wg.Add(1)
+		go func(w Worker) {
+			defer b.wg.Done()
+			w.Run()
+		}(w)
+	}
+}
+
+func (b *serviceBuilder) Close() {
+	for _, w := range b.workers {
+		w.Stop()
+	}
+	b.wg.Wait()
+}
+
+func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web, assistMetric assistMetrics.Assist, dbMetrics database.Database, pgconn pool.Pool, redisClient *redis.Client, chconn clickhouse.Conn, chSessionFactory chdb.SessionFactory, objStore objectstorage.ObjectStorage, projects projects.Projects, canvases canvas.Canvases) (Service, error) {
 	responser := api.NewResponser(webMetrics)
 
 	reqValidator := validator.New()
@@ -82,9 +113,9 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 		return nil, fmt.Errorf("failed to create view service: %s", err)
 	}
 
-	assistProxy, err := proxy.New(log, cfg, projects)
+	assistService, err := assist.NewAssist(log, cfg, pgconn, redisClient, projects, assistMetric)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create assist proxy: %s", err)
+		return nil, fmt.Errorf("failed to create assist service: %s", err)
 	}
 
 	files, err := service.New(log, cfg, objStore, canvases)
@@ -96,7 +127,7 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 	if err != nil {
 		return nil, fmt.Errorf("can't init session service: %s", err)
 	}
-	sessionHandlers, err := sessionAPI.NewHandlers(log, cfg, responser, sessionService, assistProxy, files)
+	sessionHandlers, err := sessionAPI.NewHandlers(log, cfg, responser, sessionService, assistService, files)
 	if err != nil {
 		return nil, err
 	}
@@ -105,15 +136,43 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 	if err != nil {
 		return nil, err
 	}
-	eventHandlers, err := eventAPI.NewHandlers(log, &cfg.HTTP, responser, eventService, sessionService)
+	eventHandlers, err := eventAPI.NewHandlers(log, &cfg.HTTP, responser, eventService, sessionService, projects)
 	if err != nil {
 		return nil, err
 	}
 
 	requestHandler := api.NewRequestHandler(log, responser, cfg.JsonSizeLimit)
 
-	lexiconService := lexicon.New(log, chconn)
 	segmentsService := lexicon.NewSegments(log, pgconn)
+
+	tagAdminService := tagAdmin.NewTagService(log, pgconn, chconn)
+	tagAdminHandlers, err := tagAdmin.NewHandlers(log, requestHandler, tagAdminService)
+	if err != nil {
+		return nil, err
+	}
+
+	searchService, err := search.New(log, chconn, pgconn, segmentsService, projects)
+	if err != nil {
+		return nil, err
+	}
+	searchHandlers, err := search.NewHandlers(log, cfg, responser, searchService, reqValidator)
+	if err != nil {
+		return nil, err
+	}
+
+	savedSearchesService := saved_searches.New(log, pgconn, searchService)
+	savedSearchesHandlers, err := saved_searches.NewHandlers(log, cfg, responser, savedSearchesService, reqValidator)
+	if err != nil {
+		return nil, err
+	}
+
+	filtersCatalogService := filtersCatalog.New(log, chconn, projects, savedSearchesService, tagAdminService)
+	filtersCatalogHandlers, err := filtersCatalogAPI.NewHandlers(log, requestHandler, filtersCatalogService, projects, assistService)
+	if err != nil {
+		return nil, err
+	}
+
+	lexiconService := lexicon.New(log, chconn, filtersCatalogService)
 
 	analyticsEventsService, err := analyticsEvents.New(log, chconn, lexiconService)
 	if err != nil {
@@ -139,7 +198,7 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 	if err != nil {
 		return nil, err
 	}
-	favHandlers, err := favoriteAPI.NewHandlers(log, responser, favService)
+	favHandlers, err := favoriteAPI.NewHandlers(log, responser, favService, sessionService)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +207,7 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 	if err != nil {
 		return nil, err
 	}
-	noteHandlers, err := noteAPI.NewHandlers(log, &cfg.HTTP, responser, noteService)
+	noteHandlers, err := noteAPI.NewHandlers(log, &cfg.HTTP, responser, noteService, sessionService)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +217,7 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 		return nil, err
 	}
 
-	apiKeyHandlers, err := api_key.NewHandlers(log, requestHandler, projects, usersService, analyticsEventsService, jobsService, assistProxy, cfg)
+	apiKeyHandlers, err := api_key.NewHandlers(log, requestHandler, projects, usersService, analyticsEventsService, jobsService, assistService, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -169,17 +228,8 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 		return nil, err
 	}
 
-	searchService, err := search.New(log, chconn, pgconn, segmentsService)
-	if err != nil {
-		return nil, err
-	}
-	searchHandlers, err := search.NewHandlers(log, cfg, responser, searchService, reqValidator)
-	if err != nil {
-		return nil, err
-	}
-
 	cardsService := cards.New(log, pgconn)
-	cardsHandlers, err := cards.NewHandlers(log, cfg, responser, cardsService, reqValidator)
+	cardsHandlers, err := cards.NewHandlers(log, cfg, responser, cardsService, reqValidator, charts.ValidateBreakdowns)
 	if err != nil {
 		return nil, err
 	}
@@ -202,19 +252,29 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 		return nil, err
 	}
 
-	savedSearchesService := saved_searches.New(log, pgconn, searchService)
-	savedSearchesHandlers, err := saved_searches.NewHandlers(log, cfg, responser, savedSearchesService, reqValidator)
-	if err != nil {
-		return nil, err
-	}
-
 	lexiconHandlers, err := lexiconAPI.NewHandlers(log, requestHandler, lexiconService)
 	if err != nil {
 		return nil, err
 	}
 
-	tagAdminService := tagAdmin.NewTagService(log, pgconn, chconn)
-	tagAdminHandlers, err := tagAdmin.NewHandlers(log, requestHandler, tagAdminService)
+	integrator, err := integrationsService.NewService(log, pgconn, objStore)
+	if err != nil {
+		return nil, err
+	}
+	integrationsHandlers, err := integrationsAPI.NewHandlers(log, cfg.JsonSizeLimit, responser, integrator)
+	if err != nil {
+		return nil, err
+	}
+
+	extraHandlers, workers, err := eeServices(eeDeps{
+		log:        log,
+		cfg:        cfg,
+		pgconn:     pgconn,
+		objStore:   objStore,
+		projects:   projects,
+		webMetrics: webMetrics,
+		dbMetrics:  dbMetrics,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -236,5 +296,9 @@ func NewServiceBuilder(log logger.Logger, cfg *config.Config, webMetrics web.Web
 		usersAPI:           usersHandlers,
 		lexiconAPI:         lexiconHandlers,
 		tagsAdminAPI:       tagAdminHandlers,
+		filtersCatalogAPI:  filtersCatalogHandlers,
+		integrationsAPI:    integrationsHandlers,
+		extraHandlers:      extraHandlers,
+		workers:            workers,
 	}, nil
 }

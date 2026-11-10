@@ -34,6 +34,15 @@ func getIDFromRequest(r *http.Request, key string) (int, error) {
 	return id, nil
 }
 
+func parseWithStats(r *http.Request) bool {
+	v := r.URL.Query().Get("withStats")
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return true
+	}
+	return b
+}
+
 func getSearchIDFromRequest(r *http.Request) (string, error) {
 	vars := mux.Vars(r)
 	searchID := vars["searchId"]
@@ -125,7 +134,8 @@ func (e *handlersImpl) getSavedSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := e.savedSearches.Get(projectID, searchID)
+	currentUser := r.Context().Value("userData").(*user.User)
+	resp, err := e.savedSearches.Get(projectID, currentUser.ID, searchID)
 	if err != nil {
 		if errors.Is(err, ErrSavedSearchNotFound) {
 			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusNotFound, err, startTime, r.URL.Path, bodySize)
@@ -154,15 +164,24 @@ func (e *handlersImpl) listSavedSearches(w http.ResponseWriter, r *http.Request)
 	offset := 0
 
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 100 {
-			limit = l
+		l, err := strconv.Atoi(limitStr)
+		if err != nil || l <= 0 {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid limit: %s (must be a positive integer)", limitStr), startTime, r.URL.Path, bodySize)
+			return
 		}
+		if l > 200 {
+			l = 200
+		}
+		limit = l
 	}
 
 	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
-		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
-			offset = o
+		o, err := strconv.Atoi(offsetStr)
+		if err != nil || o < 0 {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, fmt.Errorf("invalid offset: %s (must be a non-negative integer)", offsetStr), startTime, r.URL.Path, bodySize)
+			return
 		}
+		offset = o
 	}
 
 	sort := "createdAt"
@@ -185,7 +204,9 @@ func (e *handlersImpl) listSavedSearches(w http.ResponseWriter, r *http.Request)
 		order = o
 	}
 
-	searches, total, err := e.savedSearches.List(r.Context(), projectID, currentUser.ID, limit, offset, sort, order)
+	withStats := parseWithStats(r)
+
+	searches, total, err := e.savedSearches.List(r.Context(), projectID, currentUser.ID, limit, offset, sort, order, withStats)
 	if err != nil {
 		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, err, startTime, r.URL.Path, bodySize)
 		return

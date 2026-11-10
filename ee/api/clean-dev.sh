@@ -19,19 +19,17 @@ rm -rf ./chalicelib/core/metrics/custom_metrics.py
 rm -rf ./chalicelib/core/metrics/funnels.py
 rm -rf ./chalicelib/core/metrics/dashboards.py
 rm -rf ./chalicelib/core/metrics/heatmaps
-rm -rf ./chalicelib/core/metrics/product_analytics
-rm -rf ./chalicelib/core/metrics/product_anaytics2.py
 rm -rf ./chalicelib/core/events
-rm -rf ./chalicelib/core/feature_flags.py
 rm -rf ./chalicelib/core/issue_tracking
 rm -rf ./chalicelib/core/integrations_manager.py
 rm -rf ./chalicelib/core/issues
 rm -rf ./chalicelib/core/jobs.py
 rm -rf ./chalicelib/core/log_tools
+find ./chalicelib/core/mcp -maxdepth 1 -name "*.py" ! -name "authorizers.py" -delete
 rm -rf ./chalicelib/core/metadata.py
 rm -rf ./chalicelib/core/mobile.py
 rm -rf ./chalicelib/core/saved_search.py
-rm -rf ./chalicelib/core/sessions/*.py
+find ./chalicelib/core/sessions -maxdepth 1 -name "*.py" ! -name "sessions_pg.py" -delete
 rm -rf ./chalicelib/core/sessions/sessions_viewed
 rm -rf ./chalicelib/core/sessions/sessions_favorite/sessions_favorite.py
 rm -rf ./chalicelib/core/sessions/sessions_devtool/sessions_devtool.py
@@ -40,12 +38,10 @@ rm -rf ./chalicelib/core/socket_ios.py
 rm -rf ./chalicelib/core/sourcemaps
 rm -rf ./chalicelib/core/user_testing.py
 rm -rf ./chalicelib/core/tags.py
-rm -rf ./chalicelib/core/product_analytics
 rm -rf ./chalicelib/saml
 rm -rf ./chalicelib/utils/__init__.py
 rm -rf ./chalicelib/utils/args_transformer.py
 rm -rf ./chalicelib/core/boarding.py
-rm -rf ./chalicelib/core/canvas.py
 rm -rf ./chalicelib/utils/captcha.py
 rm -rf ./chalicelib/utils/dev.py
 rm -rf ./chalicelib/utils/email_handler.py
@@ -79,6 +75,7 @@ rm -rf ./run-dev.sh
 rm -rf ./run-db_init-dev.sh
 rm -rf ./schemas/overrides.py
 rm -rf ./schemas/schemas.py
+rm -rf ./schemas/schemas_mcp.py
 rm -rf ./schemas/transformers_validators.py
 rm -rf ./orpy.py
 rm -rf ./chalicelib/core/usability_testing/
@@ -86,10 +83,8 @@ rm -rf ./chalicelib/core/db_request_handler.py
 rm -rf ./chalicelib/utils/or_cache
 rm -rf ./routers/subs/health.py
 rm -rf ./chalicelib/core/spot.py
-rm -rf ./chalicelib/core/product_anaytics2.py
 rm -rf ./chalicelib/utils/ch_client.py
 rm -rf ./chalicelib/utils/ch_client_exp.py
-rm -rf ./routers/subs/product_anaytics.py
 rm -rf ./chalicelib/core/alerts/__init__.py
 rm -rf ./chalicelib/core/alerts/alerts.py
 rm -rf ./chalicelib/core/alerts/alerts_processor.py
@@ -99,6 +94,4 @@ rm -rf ./chalicelib/core/alerts/modules/helpers.py
 rm -rf ./chalicelib/core/errors
 rm -rf ./chalicelib/core/notes.py
 rm -rf ./chalicelib/utils/contextual_validators.py
-rm -rf ./routers/subs/product_analytics.py
-rm -rf ./schemas/product_analytics.py
 rm -rf ./chalicelib/utils/log.py

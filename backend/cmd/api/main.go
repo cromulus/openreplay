@@ -8,9 +8,11 @@ import (
 	"openreplay/backend/pkg/canvas"
 	"openreplay/backend/pkg/db/clickhouse"
 	"openreplay/backend/pkg/db/postgres/pool"
+	"openreplay/backend/pkg/db/redis"
 	"openreplay/backend/pkg/health"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/metrics"
+	assistMetrics "openreplay/backend/pkg/metrics/assist"
 	"openreplay/backend/pkg/metrics/database"
 	"openreplay/backend/pkg/metrics/web"
 	"openreplay/backend/pkg/objectstorage/store"
@@ -30,7 +32,8 @@ func main() {
 
 	webMetrics := web.New("api")
 	dbMetric := database.New("api")
-	metrics.New(log, append(webMetrics.List(), dbMetric.List()...))
+	assistMetric := assistMetrics.New("assist")
+	metrics.New(log, append(append(webMetrics.List(), dbMetric.List()...), assistMetric.List()...))
 
 	pgPool, err := pool.New(dbMetric, cfg.Postgres.String())
 	if err != nil {
@@ -40,6 +43,16 @@ func main() {
 
 	h.Register("postgres", func(ctx context.Context) error {
 		return pgPool.Ping(ctx)
+	})
+
+	redisClient, err := redis.New(&cfg.Redis)
+	if err != nil {
+		log.Warn(ctx, "can't init redis connection: %s", err)
+	}
+	defer redisClient.Close()
+
+	h.Register("redis", func(ctx context.Context) error {
+		return redisClient.Ping(ctx)
 	})
 
 	chConnection, err := clickhouse.NewConnection(cfg.Clickhouse)
@@ -60,7 +73,7 @@ func main() {
 		log.Fatal(ctx, "can't init object storage: %s", err)
 	}
 
-	projects := projects.New(log, pgPool, nil, dbMetric)
+	projects := projects.New(log, pgPool, redisClient, dbMetric)
 	if err != nil {
 		log.Fatal(ctx, "can't init project service: %s", err)
 	}
@@ -70,7 +83,7 @@ func main() {
 		log.Fatal(ctx, "can't init project service: %s", err)
 	}
 
-	services, err := apiService.NewServiceBuilder(log, cfg, webMetrics, pgPool, chConnection, chSessionFactory, objStore, projects, canvases)
+	services, err := apiService.NewServiceBuilder(log, cfg, webMetrics, assistMetric, dbMetric, pgPool, redisClient, chConnection, chSessionFactory, objStore, projects, canvases)
 	if err != nil {
 		log.Fatal(ctx, "can't init services and handlers: %s", err)
 	}
@@ -88,5 +101,7 @@ func main() {
 		log.Fatal(ctx, "failed while creating router: %s", err)
 	}
 
+	services.Run()
 	server.Run(ctx, log, &cfg.HTTP, router)
+	services.Close()
 }

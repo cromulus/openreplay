@@ -16,10 +16,8 @@ apps=(
     db
     ender
     http
-    integrations
     sink
     storage
-    heuristics
     assist
     peers
     all
@@ -73,11 +71,6 @@ restart(){
             source build.sh nil http
             restart http
             ;;
-        integrations)
-            cd ../../backend
-            source build.sh nil integrations
-            restart integrations
-            ;;
         sink)
             cd ../../backend
             source build.sh nil sink
@@ -87,11 +80,6 @@ restart(){
             cd ../../backend
             source build.sh nil storage
             restart storage
-            ;;
-        heuristics)
-            cd ../../backend
-            source build.sh nil heuristics
-            restart heuristics
             ;;
         assist)
             cd ../../utilities

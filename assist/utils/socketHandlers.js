@@ -5,7 +5,9 @@ const {
     IDENTITIES,
     EVENTS_DEFINITION,
     extractSessionInfo,
-    errorHandler
+    errorHandler,
+    agentCanCall,
+    agentMaySend,
 } = require("./assistHelper");
 const {
     startAssist,
@@ -17,11 +19,7 @@ const {
 } = require('../utils/wsServer');
 const {
     IncreaseTotalWSConnections,
-    IncreaseOnlineConnections,
-    DecreaseOnlineConnections,
     IncreaseTotalRooms,
-    IncreaseOnlineRooms,
-    DecreaseOnlineRooms,
 } = require('../utils/metrics');
 const {logger} = require('./logger');
 const deepMerge = require('@fastify/deepmerge')({all: true});
@@ -79,9 +77,17 @@ function processNewSocket(socket) {
 
 async function onConnect(socket) {
     logger.debug(`WS started:${socket.id}, Query:${JSON.stringify(socket.handshake.query)}`);
+    const peer = typeof socket.handshake.query.peerId === 'string' ? extractPeerId(socket.handshake.query.peerId) : {};
+    if (!Object.values(IDENTITIES).includes(socket.handshake.query.identity) || !peer.projectKey || !peer.sessionId) {
+        logger.debug(`unknown identity or malformed peerId, refusing connexion`);
+        return socket.disconnect();
+    }
+    if (socket.handshake.query.identity === IDENTITIES.session && socket.handshake.query.sessionInfo === undefined) {
+        logger.debug(`sessionInfo is undefined, refusing connexion`);
+        return socket.disconnect();
+    }
     processNewSocket(socket);
     IncreaseTotalWSConnections(socket.handshake.query.identity);
-    IncreaseOnlineConnections(socket.handshake.query.identity);
 
     const io = getServer();
     const {tabsCount, agentsCount, tabIDs, agentInfos, agentIDs, config} = await getRoomData(io, socket.handshake.query.roomId);
@@ -97,11 +103,12 @@ async function onConnect(socket) {
                 }
             }
         }
-        extractSessionInfo(socket);
+        if (!extractSessionInfo(socket)) {
+            return socket.disconnect();
+        }
         if (tabsCount < 0) {
             // New session creates new room
             IncreaseTotalRooms();
-            IncreaseOnlineRooms();
         }
         // Inform all connected agents about reconnected session
         if (agentsCount > 0) {
@@ -121,8 +128,13 @@ async function onConnect(socket) {
 
     if (socket.handshake.query.identity === IDENTITIES.agent) {
         if (socket.handshake.query.agentInfo !== undefined) {
-            socket.handshake.query.agentInfo = JSON.parse(socket.handshake.query.agentInfo);
-            socket.handshake.query.agentID = socket.handshake.query.agentInfo.id;
+            try {
+                socket.handshake.query.agentInfo = JSON.parse(socket.handshake.query.agentInfo);
+            } catch (e) {
+                logger.debug(`invalid agentInfo, peerId: ${socket.handshake.query.peerId}, err: ${e.message}`);
+                return socket.disconnect();
+            }
+            socket.handshake.query.agentID = socket.handshake.query.agentInfo?.id;
             // Stats
             startAssist(socket, socket.handshake.query.agentID);
         }
@@ -149,7 +161,6 @@ async function onConnect(socket) {
 }
 
 async function onDisconnect(socket) {
-    DecreaseOnlineConnections(socket.handshake.query.identity);
     logger.debug(`${socket.id} disconnected from ${socket.handshake.query.roomId}`);
 
     if (socket.handshake.query.identity === IDENTITIES.agent) {
@@ -162,7 +173,6 @@ async function onDisconnect(socket) {
     let {tabsCount, agentsCount, tabIDs, agentIDs} = await getRoomData(io, socket.handshake.query.roomId);
 
     if (tabsCount === -1 && agentsCount === -1) {
-        DecreaseOnlineRooms();
         logger.debug(`room not found: ${socket.handshake.query.roomId}`);
         return;
     }
@@ -200,6 +210,10 @@ async function onUpdateEvent(socket, ...args) {
 
 async function onWebrtcAgentHandler(socket, ...args) {
     if (socket.handshake.query.identity === IDENTITIES.agent) {
+        if (!agentCanCall(socket)) {
+            logger.debug(`${socket.id} has no call permission, dropping webrtc agent event`);
+            return;
+        }
         const agentIdToConnect = args[0]?.data?.toAgentId;
         logger.debug(`${socket.id} sent webrtc event to agent:${agentIdToConnect}`);
         if (agentIdToConnect && socket.handshake.sessionData.AGENTS_CONNECTED.includes(agentIdToConnect)) {
@@ -218,6 +232,10 @@ async function onAny(socket, eventName, ...args) {
         logger.debug(`received event:${eventName}, from:${socket.handshake.query.identity}, sending message to room:${socket.handshake.query.roomId}`);
         socket.to(socket.handshake.query.roomId).emit(eventName, args[0]);
     } else {
+        if (!agentMaySend(socket, eventName)) {
+            logger.debug(`${socket.id} has no call permission, dropping event:${eventName}`);
+            return;
+        }
         // Stats
         handleEvent(eventName, socket, args[0]);
         logger.debug(`received event:${eventName}, from:${socket.handshake.query.identity}, sending message to session of room:${socket.handshake.query.roomId}`);

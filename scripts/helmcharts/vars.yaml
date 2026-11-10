@@ -1,4 +1,4 @@
-fromVersion: "v1.27.0"
+fromVersion: "v1.28.0"
 # Databases specific variables
 postgresql: &postgres
   # For generating passwords
@@ -131,6 +131,7 @@ global:
   tokenSecret: "{{randAlphaNum 20}}"
   jwtRefreshSecret: "{{randAlphaNum 20}}"
   jwtSpotRefreshSecret: "{{randAlphaNum 20}}"
+  jwtMcpSecret: "{{randAlphaNum 20}}"
   # SCIM authentication secrets for chalice service (optional)
   # Uncomment and set these values if SCIM authentication is required
   # scimAccessSecretKey: "{{randAlphaNum 20}}"
@@ -151,6 +152,7 @@ global:
     # This is only for enterpriseEdition
     assistRecordsBucket: "records"
     vaultBucket: "vault-data"
+    replayExporterBucket: "replay-exporter-videos"
     # if you're using one node installation, where
     # you're using local s3, make sure these variables
     # are same as minio.global.minio.accesskey and  secretKey
@@ -167,9 +169,6 @@ global:
     emailSslCert: ""
     emailFrom: "OpenReplay<do-not-reply@openreplay.com>"
 
-  # Only for ee
-  ee-components:
-    enabled: false
   enterpriseEditionLicense: ""
   # Optional: Use external secret for license key
   license:
@@ -189,8 +188,6 @@ global:
     # idp_name: ''
     # idp_tenantKey: ''
     # enforce_SSO: 'false'
-    # SCIM_ACCESS_SECRET_KEY:
-    # SCIM_REFRESH_SECRET_KEY:
     # SCIM_JWT_ALGORITHM: 'HS512'
     # SCIM_ACCESS_TOKEN_EXPIRE_SECONDS: '86400'
     # SCIM_REFRESH_TOKEN_EXPIRE_SECONDS: '2592000'

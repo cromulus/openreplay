@@ -1,4 +1,4 @@
-/** @type {import('ts-jest/dist/types').InitialOptionsTsJest} */
+/** @type {import('ts-jest').JestConfigWithTsJest} */
 const config = {
   preset: 'ts-jest',
   testEnvironment: 'jsdom',
@@ -8,14 +8,27 @@ const config = {
   moduleNameMapper: {
     '(.+)\\.js': '$1',
   },
-  globals: {
-    'ts-jest': {
-      tsConfig: {
-        target: 'es2020',
-        lib: ['DOM', 'ES2022'],
+  transform: {
+    // ESM-only deps (error-stack-parser-es) ship .mjs; tsc always emits ESM for
+    // .mjs regardless of `module`, so babel has to downlevel them to CJS.
+    '^.+\\.mjs$': [
+      'babel-jest',
+      { plugins: ['@babel/plugin-transform-modules-commonjs'], babelrc: false, configFile: false },
+    ],
+    '^.+\\.m?[tj]sx?$': [
+      'ts-jest',
+      {
+        tsconfig: {
+          target: 'es2020',
+          lib: ['DOM', 'ES2022'],
+          allowJs: true,
+        },
       },
-    },
+    ],
   },
+  // Unanchored `.*` so this holds for npm's flat node_modules and for bun's
+  // nested one (node_modules/.bun/<name>@<ver>/node_modules/<name>/...).
+  transformIgnorePatterns: ['/node_modules/(?!.*error-stack-parser-es)'],
 }
 
 export default config

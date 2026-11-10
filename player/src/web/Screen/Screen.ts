@@ -3,6 +3,7 @@ import Cursor from './Cursor';
 import SelectDropdown from './SelectDropdown';
 
 import type { Point, Dimensions } from './types';
+import { isHTMLElement, isSelectElement } from '../../guards';
 
 export type State = Dimensions;
 
@@ -78,6 +79,10 @@ export default class Screen {
     iframe.className = styles.iframe;
     // These flags are fixed when the browsing
     // context is created, so this MUST be set before the iframe is attached.
+    // No allow-scripts: a crafted recording then can never execute JS in the
+    // app origin, whatever slips past sanitize.ts. That also disables scripting
+    // for the document, which stops <canvas> from painting its bitmap — see
+    // CanvasManager#paintFrame for how replayed canvases are rendered instead.
     iframe.setAttribute('sandbox', 'allow-same-origin');
     this.iframe = iframe;
 
@@ -120,7 +125,7 @@ export default class Screen {
     if (this.remoteControlActive) {
       return;
     }
-    if (node instanceof HTMLSelectElement) {
+    if (isSelectElement(node)) {
       this.selectMenu.open(node);
     } else {
       this.selectMenu.hide();
@@ -146,6 +151,11 @@ export default class Screen {
   }
 
   clean() {
+    if (this.clickHighlightTimeout) {
+      clearTimeout(this.clickHighlightTimeout);
+      this.clickHighlightTimeout = undefined;
+    }
+    this.clickHighlightBox = null;
     this.selectMenu.remove(); // clears its pending timer + scroll listener
     this.iframe?.remove?.();
     this.overlay?.remove?.();
@@ -187,6 +197,16 @@ export default class Screen {
 
   get window(): WindowProxy | null {
     return this.iframe.contentWindow;
+  }
+
+  /**
+   * Whether scripting is enabled for the replay document — i.e. whether a
+   * <canvas> in it will paint its bitmap at all. False under the sandbox above.
+   * See CanvasManager#paintFrame for why canvas replay needs to know.
+   */
+  get scriptingEnabled(): boolean {
+    const sandbox = this.iframe.getAttribute('sandbox');
+    return sandbox === null || sandbox.split(/\s+/).includes('allow-scripts');
   }
 
   get document(): Document | null {
@@ -342,6 +362,80 @@ export default class Screen {
   public clearSelection() {
     this.selectionTargets?.forEach((el) => el.remove());
     this.selectionTargets = [];
+  }
+
+  private clickHighlightBox: HTMLDivElement | null = null;
+  private clickHighlightTimeout?: ReturnType<typeof setTimeout>;
+
+  /**
+   * Timer/screenshot mode only: draw red corner brackets around the clicked
+   * element for ~500ms so the click target is captured by a 2fps frame.
+   * Rendered in the overlay (not the iframe doc — vdom patches would wipe it).
+   * The overlay shares the cursor's coordinate space (viewport px, scaled by the
+   * screen transform), so element viewport rects map straight through; only
+   * nested-iframe offsets need adding.
+   */
+  public highlightClick(node?: Node | null): void {
+    if (!isHTMLElement(node)) return;
+
+    const rect = node.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+
+    // Add each ancestor iframe's offset until we reach the replay root window,
+    // so a click inside a nested iframe still lines up in the overlay.
+    let left = rect.left;
+    let top = rect.top;
+    let win: Window | null = node.ownerDocument.defaultView;
+    while (win && win !== this.window && win.frameElement) {
+      const frameRect = win.frameElement.getBoundingClientRect();
+      left += frameRect.left;
+      top += frameRect.top;
+      win = win.parent === win ? null : win.parent;
+    }
+
+    if (this.clickHighlightTimeout) {
+      clearTimeout(this.clickHighlightTimeout);
+    }
+    this.clickHighlightBox?.remove();
+
+    const box = document.createElement('div');
+    Object.assign(box.style, {
+      position: 'absolute',
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      pointerEvents: 'none',
+      zIndex: '2147483647',
+    });
+
+    const arm = 12; // bracket arm length, px
+    const thick = 3; // border thickness, px
+    const red = `${thick}px solid #cc0000`;
+    const corners: Array<Partial<CSSStyleDeclaration>> = [
+      { top: '0', left: '0', borderTop: red, borderLeft: red },
+      { top: '0', right: '0', borderTop: red, borderRight: red },
+      { bottom: '0', left: '0', borderBottom: red, borderLeft: red },
+      { bottom: '0', right: '0', borderBottom: red, borderRight: red },
+    ];
+    corners.forEach((pos) => {
+      const corner = document.createElement('div');
+      Object.assign(corner.style, {
+        position: 'absolute',
+        width: `${arm}px`,
+        height: `${arm}px`,
+        ...pos,
+      });
+      box.appendChild(corner);
+    });
+
+    this.overlay.appendChild(box);
+    this.clickHighlightBox = box;
+    this.clickHighlightTimeout = setTimeout(() => {
+      box.remove();
+      this.clickHighlightBox = null;
+      this.clickHighlightTimeout = undefined;
+    }, 750);
   }
 
   private highlightedElement: HTMLElement | null = null;

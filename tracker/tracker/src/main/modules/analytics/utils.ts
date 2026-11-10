@@ -19,7 +19,10 @@ interface ClientOS {
 /**
  * Detects client browser, OS, and device information
  */
-export function uaParse(sWindow: Window & typeof globalThis): ClientData {
+export function uaParse(
+  sWindow: Window & typeof globalThis,
+  onOsVersionUpdate?: (osVersion: string) => void,
+): ClientData {
   const unknown = '-'
 
   // Screen detection
@@ -184,7 +187,11 @@ export function uaParse(sWindow: Window & typeof globalThis): ClientData {
             .getHighEntropyValues(['platformVersion'])
             .then((ua) => {
               const version = parseInt(ua.platformVersion.split('.')[0], 10)
-              osVersion = version < 13 ? '10' : '11'
+              // uaParse has already returned by the time this resolves, so a local
+              // assignment would be lost - notify the caller to update its state.
+              const refined = version < 13 ? '10' : '11'
+              osVersion = refined
+              onOsVersionUpdate?.(refined)
             })
             .catch(() => {
               // ignore errors and keep osVersion as is
@@ -238,7 +245,7 @@ export function getUTCOffsetString() {
   const date = new Date()
   const offsetMinutes = date.getTimezoneOffset()
 
-  const hours = Math.abs(Math.floor(offsetMinutes / 60))
+  const hours = Math.floor(Math.abs(offsetMinutes) / 60)
   const minutes = Math.abs(offsetMinutes % 60)
 
   const sign = offsetMinutes <= 0 ? '+' : '-'

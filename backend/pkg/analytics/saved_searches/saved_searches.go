@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 
 	"openreplay/backend/pkg/analytics/model"
 	"openreplay/backend/pkg/analytics/search"
@@ -28,12 +30,20 @@ const (
 	statsQueryTimeout    = 10 * time.Second
 )
 
+// SegmentsListItem is a lightweight projection used by the filters catalog.
+type SegmentsListItem struct {
+	SearchID string
+	Name     string
+	IsPublic bool
+}
+
 type SavedSearches interface {
 	Save(projectID int, userID uint64, req *model.SavedSearchRequest) (*model.SavedSearchResponse, error)
-	Get(projectID int, searchID string) (*model.SavedSearch, error)
-	List(ctx context.Context, projectID int, userID uint64, limit, offset int, sort, order string) ([]*model.SavedSearch, int, error)
+	Get(projectID int, userID uint64, searchID string) (*model.SavedSearch, error)
+	List(ctx context.Context, projectID int, userID uint64, limit, offset int, sort, order string, withStats bool) ([]*model.SavedSearch, int, error)
 	Update(projectID int, userID uint64, searchID string, req *model.SavedSearchRequest) (*model.SavedSearchResponse, error)
 	Delete(projectID int, userID uint64, searchID string) error
+	ListForFilters(projectID, userID int) ([]SegmentsListItem, error)
 }
 
 type savedSearchesImpl struct {
@@ -47,6 +57,7 @@ type searchStats struct {
 	SessionsCount int64
 	UsersCount    int64
 	ComputedAt    time.Time
+	Failed        bool
 }
 
 func New(log logger.Logger, conn pool.Pool, search search.Search) SavedSearches {
@@ -121,7 +132,7 @@ func (s *savedSearchesImpl) Save(projectID int, userID uint64, req *model.SavedS
 	}, nil
 }
 
-func (s *savedSearchesImpl) Get(projectID int, searchID string) (*model.SavedSearch, error) {
+func (s *savedSearchesImpl) Get(projectID int, userID uint64, searchID string) (*model.SavedSearch, error) {
 	ctx := context.Background()
 
 	const selectQuery = `
@@ -130,12 +141,13 @@ func (s *savedSearchesImpl) Get(projectID int, searchID string) (*model.SavedSea
 		FROM public.saved_searches
 		WHERE search_id=$1 AND project_id=$2 AND deleted_at IS NULL
 			AND (expires_at IS NULL OR expires_at > NOW())
+			AND (user_id=$3 OR is_public OR is_share)
 	`
 
 	var savedSearch model.SavedSearch
 	var searchDataJSON []byte
 
-	err := s.pgconn.QueryRow(selectQuery, searchID, projectID).Scan(
+	err := s.pgconn.QueryRow(selectQuery, searchID, projectID, userID).Scan(
 		&savedSearch.SearchID,
 		&savedSearch.ProjectID,
 		&savedSearch.UserID,
@@ -173,7 +185,7 @@ var sortColumns = map[string]string{
 	"userName":  "u.name",
 }
 
-func (s *savedSearchesImpl) List(ctx context.Context, projectID int, userID uint64, limit, offset int, sort, order string) ([]*model.SavedSearch, int, error) {
+func (s *savedSearchesImpl) List(ctx context.Context, projectID int, userID uint64, limit, offset int, sort, order string, withStats bool) ([]*model.SavedSearch, int, error) {
 	column, ok := sortColumns[sort]
 	if !ok {
 		column = sortColumns["createdAt"]
@@ -186,7 +198,7 @@ func (s *savedSearchesImpl) List(ctx context.Context, projectID int, userID uint
 	selectQuery := fmt.Sprintf(`
 		SELECT
 			ss.search_id, ss.project_id, ss.user_id, u.name AS user_name, ss.name, ss.is_public, ss.is_share,
-			ss.search_data, ss.created_at, ss.expires_at, ss.deleted_at,
+			ss.search_data, ss.created_at,
 			COUNT(*) OVER() AS total_count
 		FROM public.saved_searches ss
 		LEFT JOIN public.users u ON ss.user_id = u.user_id
@@ -221,8 +233,6 @@ func (s *savedSearchesImpl) List(ctx context.Context, projectID int, userID uint
 			&savedSearch.IsShare,
 			&searchDataJSON,
 			&savedSearch.CreatedAt,
-			&savedSearch.ExpiresAt,
-			&savedSearch.DeletedAt,
 			&total,
 		)
 
@@ -243,13 +253,48 @@ func (s *savedSearchesImpl) List(ctx context.Context, projectID int, userID uint
 		return nil, 0, fmt.Errorf("rows error: %w", err)
 	}
 
-	for _, ss := range searches {
-		if ctx.Err() != nil {
+	if !withStats {
+		return searches, total, nil
+	}
+
+	statsCtx, cancel := context.WithTimeout(ctx, statsQueryTimeout)
+	defer cancel()
+
+	const statsConcurrency = 8
+	sem := make(chan struct{}, statsConcurrency)
+	var wg sync.WaitGroup
+	var failed int64
+	skipped := 0
+	for i, ss := range searches {
+		select {
+		case sem <- struct{}{}:
+		case <-statsCtx.Done():
+		}
+		if statsCtx.Err() != nil {
+			skipped = len(searches) - i
 			break
 		}
-		stats := s.getSearchStats(ctx, projectID, &ss.Data)
-		ss.SessionsCount = stats.SessionsCount
-		ss.UsersCount = stats.UsersCount
+		wg.Add(1)
+		go func(ss *model.SavedSearch) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error(ctx, "saved search stats panic: %v", r)
+				}
+			}()
+			stats := s.getSearchStats(statsCtx, projectID, &ss.Data)
+			ss.SessionsCount = stats.SessionsCount
+			ss.UsersCount = stats.UsersCount
+			if stats.Failed {
+				atomic.AddInt64(&failed, 1)
+			}
+		}(ss)
+	}
+	wg.Wait()
+
+	if skipped > 0 || failed > 0 {
+		s.log.Warn(ctx, "saved search stats incomplete: %d undispatched, %d failed of %d", skipped, failed, len(searches))
 	}
 
 	return searches, total, nil
@@ -272,7 +317,7 @@ func (s *savedSearchesImpl) getSearchStats(ctx context.Context, projectID int, d
 		}
 	}
 
-	now := time.Now()
+	now := time.Now().Truncate(5 * time.Minute)
 	req := &model.SessionsSearchRequest{
 		Filters:     append([]model.Filter(nil), data.Filters...),
 		EventsOrder: data.EventsOrder,
@@ -286,7 +331,7 @@ func (s *savedSearchesImpl) getSearchStats(ctx context.Context, projectID int, d
 	sessionsCount, usersCount, err := s.search.GetCounts(qctx, projectID, req)
 	if err != nil {
 		s.log.Warn(ctx, "saved search counts: %.200s", err)
-		return searchStats{}
+		return searchStats{Failed: true}
 	}
 
 	stats := searchStats{
@@ -376,6 +421,31 @@ func (s *savedSearchesImpl) Delete(projectID int, userID uint64, searchID string
 	}
 
 	return nil
+}
+
+func (s *savedSearchesImpl) ListForFilters(projectID, userID int) ([]SegmentsListItem, error) {
+	const q = `
+        SELECT search_id, name, is_public
+        FROM public.saved_searches
+        WHERE project_id = $1
+          AND deleted_at IS NULL
+          AND is_share = FALSE
+          AND (user_id = $2 OR is_public)
+        ORDER BY name`
+	rows, err := s.pgconn.Query(q, projectID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SegmentsListItem
+	for rows.Next() {
+		var item SegmentsListItem
+		if err := rows.Scan(&item.SearchID, &item.Name, &item.IsPublic); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (s *savedSearchesImpl) checkOwnership(ctx context.Context, projectID int, userID uint64, searchID, op string) error {

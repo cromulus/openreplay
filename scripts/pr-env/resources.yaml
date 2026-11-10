@@ -30,10 +30,6 @@ assist:
   resources:
     requests:
       cpu: 50m
-assist-stats:
-  resources:
-    requests:
-      cpu: 50m
 chalice:
   resources:
     requests:
@@ -63,10 +59,6 @@ ender:
     requests:
       cpu: 50m
 frontend:
-  resources:
-    requests:
-      cpu: 50m
-heuristics:
   resources:
     requests:
       cpu: 50m

@@ -1,10 +1,13 @@
 import Message from './messages.gen.js'
 
-export type DataType = 'player' | 'assets' | 'devtools' | 'analytics'
+export type DataType = 'player' | 'assets' | 'devtools' | 'analytics' | 'visual'
 
 export interface Options {
   connAttemptCount?: number
   connAttemptGap?: number
+  /** How often (ms) the worker uploads what it has buffered. Defaults to 30 000. Anything
+   *  still buffered is lost if the page is unloaded without entering the bfcache. */
+  flushInterval?: number
 }
 
 type Start = {
@@ -15,6 +18,7 @@ type Start = {
   url: string
   tabId: string
   localDebug?: boolean
+  compressionThreshold?: number
 } & Options
 
 type Auth = {
@@ -22,6 +26,7 @@ type Auth = {
   token: string
   beaconSizeLimit?: number
   protocolVersion?: number
+  compressionThreshold?: number
 }
 
 export type ToWorkerData =
@@ -30,8 +35,6 @@ export type ToWorkerData =
   | Start
   | Auth
   | Array<Message>
-  | { type: 'compressed'; batch: Uint8Array; dataType: DataType }
-  | { type: 'uncompressed'; batch: Uint8Array; dataType: DataType }
   | 'forceFlushBatch'
   | 'closing'
   | 'check_queue'
@@ -56,6 +59,5 @@ export type FromWorkerData =
   | 'a_start'
   | Failure
   | 'not_init'
-  | { type: 'compress'; batch: Uint8Array; dataType: DataType }
   | QEmpty
   | LocalSave

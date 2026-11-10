@@ -22,6 +22,7 @@ import (
 	"openreplay/backend/pkg/messages"
 	"openreplay/backend/pkg/metrics/database"
 	qtypes "openreplay/backend/pkg/queue/types"
+	sdkmodel "openreplay/backend/pkg/sdk/model"
 	"openreplay/backend/pkg/sessions"
 	"openreplay/backend/pkg/url"
 )
@@ -52,16 +53,22 @@ type Connector interface {
 	InsertMobileRequest(session *sessions.Session, msg *messages.MobileNetworkCall, savePayload bool) error
 	InsertMobileCrash(session *sessions.Session, msg *messages.MobileCrash) error
 	InsertMobileIssue(session *sessions.Session, msg *messages.MobileIssueEvent) error
+	InsertUser(user *sdkmodel.User) error
+	InsertUserTombstone(projectID uint16, userID string) error
+	InsertUserDistinctID(projectID uint16, distinctID, userID string) error
 	Commit() error
 	OnBatchEnd(topic string, partition int32, offset int64)
-	SetCommitter(committer OffsetCommitter)
+	TrackOffset(topic string, partition int32, offset int64)
+	AddCommitter(committer OffsetCommitter)
+	SetRowRefresher(table string, refresh func(rows [][]interface{}) [][]interface{})
 	Stop() error
 }
 
 type task struct {
-	seq   uint64
-	bulks []Batch
-	snap  qtypes.Offsets
+	seq       uint64
+	bulks     []Batch
+	snap      qtypes.Offsets
+	flushedAt time.Time
 }
 
 func NewTask() *task {
@@ -85,7 +92,8 @@ type connectorImpl struct {
 	batches        map[string]Batch
 	pending        qtypes.Offsets
 	needToFlush    bool
-	committer      OffsetCommitter
+	committers     []OffsetCommitter
+	refreshers     map[string]func([][]interface{}) [][]interface{}
 	seq            uint64 // last assigned task seq
 	workerTask     chan *task
 	inflight       chan struct{}
@@ -148,20 +156,47 @@ func NewConnector(log logger.Logger, conn driver.Conn, metrics database.Database
 }
 
 var batches = map[string]string{
-	"sessions":        "INSERT INTO experimental.sessions (session_id, project_id, user_id, user_uuid, user_os, user_os_version, user_device, user_device_type, user_country, user_state, user_city, datetime, duration, pages_count, events_count, errors_count, referrer, issue_types, tracker_version, user_browser, user_browser_version, metadata_1, metadata_2, metadata_3, metadata_4, metadata_5, metadata_6, metadata_7, metadata_8, metadata_9, metadata_10, platform, timezone, utm_source, utm_medium, utm_campaign, screen_width, screen_height) VALUES (?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?)",
-	"web_events":      `INSERT INTO product_analytics.events (session_id, project_id, event_id, "$event_name", created_at, "$time", distinct_id, "$device_id", "$user_id", "$auto_captured", "$device", "$os_version", "$os", "$browser", "$referrer", "$country", "$state", "$city", "$current_url", "$duration_s", error_id, issue_type, issue_id, "$screen_width", "$screen_height", "$properties", properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	"issues":          "INSERT INTO experimental.issues (project_id, issue_id, type, context_string) VALUES (?, ?, ?, ?)",
-	"mobile_sessions": "INSERT INTO experimental.sessions (session_id, project_id, user_id, user_uuid, user_os, user_os_version, user_device, user_device_type, user_country, user_state, user_city, datetime, duration, pages_count, events_count, errors_count, referrer, issue_types, tracker_version, user_browser, user_browser_version, metadata_1, metadata_2, metadata_3, metadata_4, metadata_5, metadata_6, metadata_7, metadata_8, metadata_9, metadata_10, platform, timezone) VALUES (?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), ?, ?)",
-	"mobile_events":   `INSERT INTO product_analytics.events (session_id, project_id, event_id, "$event_name", created_at, "$time", distinct_id, "$device_id", "$user_id", "$auto_captured", "$device", "$os_version", "$properties") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	"sessions":             "INSERT INTO experimental.sessions (session_id, project_id, user_id, user_uuid, user_os, user_os_version, user_device, user_device_type, user_country, user_state, user_city, datetime, duration, pages_count, events_count, errors_count, referrer, issue_types, tracker_version, user_browser, user_browser_version, metadata_1, metadata_2, metadata_3, metadata_4, metadata_5, metadata_6, metadata_7, metadata_8, metadata_9, metadata_10, platform, timezone, utm_source, utm_medium, utm_campaign, screen_width, screen_height) VALUES (?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?)",
+	"web_events":           `INSERT INTO product_analytics.events (session_id, project_id, event_id, "$event_name", created_at, "$time", distinct_id, "$device_id", "$user_id", "$auto_captured", "$device", "$os_version", "$os", "$browser", "$referrer", "$country", "$state", "$city", "$current_url", "$duration_s", error_id, issue_type, issue_id, "$screen_width", "$screen_height", "$properties", properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	"issues":               "INSERT INTO experimental.issues (project_id, issue_id, type, context_string) VALUES (?, ?, ?, ?)",
+	"pa_users":             `INSERT INTO product_analytics.users (project_id, "$user_id", "$email", "$name", "$first_name", "$last_name", "$phone", "$avatar", properties, group_id1, group_id2, group_id3, group_id4, group_id5, group_id6, "$sdk_edition", "$sdk_version", "$current_url", "$initial_referrer", "$referring_domain", initial_utm_source, initial_utm_medium, initial_utm_campaign, "$country", "$state", "$city", "$or_api_endpoint", "$created_at", "$first_event_at", "$last_seen", _deleted_at, _is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	"pa_users_distinct_id": `INSERT INTO product_analytics.users_distinct_id (project_id, distinct_id, "$user_id") VALUES (?, ?, ?)`,
+	"mobile_sessions":      "INSERT INTO experimental.sessions (session_id, project_id, user_id, user_uuid, user_os, user_os_version, user_device, user_device_type, user_country, user_state, user_city, datetime, duration, pages_count, events_count, errors_count, referrer, issue_types, tracker_version, user_browser, user_browser_version, metadata_1, metadata_2, metadata_3, metadata_4, metadata_5, metadata_6, metadata_7, metadata_8, metadata_9, metadata_10, platform, timezone) VALUES (?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SUBSTR(?, 1, 8000), ?, ?, ?, ?, SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), SUBSTR(?, 1, 8000), ?, ?)",
+	"mobile_events":        `INSERT INTO product_analytics.events (session_id, project_id, event_id, "$event_name", created_at, "$time", distinct_id, "$device_id", "$user_id", "$auto_captured", "$device", "$os_version", "$properties") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (c *connectorImpl) newBatch(name, query string) error {
-	batch, err := NewBatch(c.log, c.conn, c.metrics, name, query, c.batchSizeLimit)
+	var batch Batch
+	var err error
+	if name == "pa_users" {
+		batch, err = NewKeyedBatch(c.log, c.conn, c.metrics, name, query, c.batchSizeLimit, userKey)
+	} else {
+		batch, err = NewBatch(c.log, c.conn, c.metrics, name, query, c.batchSizeLimit)
+	}
 	if err != nil {
 		return fmt.Errorf("can't create new batch: %s", err)
 	}
+	if refresh := c.refreshers[name]; refresh != nil {
+		batch.(*batchImpl).refresh = refresh
+	}
 	c.batches[name] = batch
 	return nil
+}
+
+func (c *connectorImpl) SetRowRefresher(table string, refresh func(rows [][]interface{}) [][]interface{}) {
+	c.mu.Lock()
+	if c.refreshers == nil {
+		c.refreshers = make(map[string]func([][]interface{}) [][]interface{})
+	}
+	c.refreshers[table] = refresh
+	if b, ok := c.batches[table]; ok {
+		b.(*batchImpl).refresh = refresh
+	}
+	c.mu.Unlock()
+}
+
+func userKey(args []interface{}) string {
+	return fmt.Sprintf("%v|%v", args[0], args[1])
 }
 
 func (c *connectorImpl) prepare() error {
@@ -173,8 +208,20 @@ func (c *connectorImpl) prepare() error {
 	return nil
 }
 
-func (c *connectorImpl) SetCommitter(committer OffsetCommitter) {
-	c.committer = committer
+func (c *connectorImpl) AddCommitter(committer OffsetCommitter) {
+	c.mu.Lock()
+	c.committers = append(c.committers, committer)
+	c.mu.Unlock()
+}
+
+func (c *connectorImpl) TrackOffset(topic string, partition int32, offset int64) {
+	c.mu.Lock()
+	if c.pending[topic] == nil {
+		c.pending[topic] = make(map[int32]int64)
+	}
+	c.pending[topic][partition] = offset
+	c.needToFlush = true
+	c.mu.Unlock()
 }
 
 func (c *connectorImpl) OnBatchEnd(topic string, partition int32, offset int64) {
@@ -218,12 +265,14 @@ func (c *connectorImpl) flush() {
 		log.Printf("can't prepare new CH batch set: %s", err)
 	}
 	newTask.snap = copyOffsets(c.pending)
+	newTask.flushedAt = time.Now()
 	c.seq++
 	newTask.seq = c.seq
 	c.needToFlush = false
 	c.mu.Unlock()
 	c.inflight <- struct{}{}
 	c.workerTask <- newTask
+	c.metrics.RecordCHQueueDepth(float64(len(c.workerTask)))
 }
 
 func copyOffsets(src qtypes.Offsets) qtypes.Offsets {
@@ -307,12 +356,14 @@ func (c *connectorImpl) sendBulk(b Batch) {
 			log.Fatalf("FATAL_CH_NO_SPACE: ClickHouse code 243, restarting to limit data loss: %s", err)
 		}
 		if isPermanentDataError(err) {
+			c.metrics.RecordBulkDroppedRows(float64(b.Len()), "ch", b.Table())
 			log.Printf("BROKEN_BATCH_DROPPED: table=%s rows=%d, unparseable data, dropping batch: %s", b.Table(), b.Len(), err)
 			return
 		}
 		if attempt >= maxSendAttempts {
 			log.Fatalf("FATAL_CH_SEND: table=%s giving up after %d attempts, restarting: %s", b.Table(), attempt, err)
 		}
+		c.metrics.IncreaseBulkSendRetries("ch", b.Table())
 		log.Printf("can't send batch (attempt %d): %s", attempt, err)
 		time.Sleep(backoff)
 		if backoff < sendRetryMax {
@@ -337,11 +388,16 @@ func (c *connectorImpl) sendBulks(t *task) {
 }
 
 func (c *connectorImpl) commitOffsets(t *task) {
-	if t.snap == nil || c.committer == nil {
+	if t.snap == nil {
 		return
 	}
-	if err := c.committer.CommitOffsets(t.snap); err != nil {
-		log.Printf("can't commit offsets: %s", err)
+	c.mu.Lock()
+	committers := c.committers
+	c.mu.Unlock()
+	for _, committer := range committers {
+		if err := committer.CommitOffsets(t.snap); err != nil {
+			log.Printf("can't commit offsets: %s", err)
+		}
 	}
 }
 
@@ -1640,4 +1696,50 @@ func cropStringPtr(s *string) *string {
 		*s = (*s)[:8000]
 	}
 	return s
+}
+
+var noDeleteTime = time.Unix(0, 0)
+
+func UserRow(u *sdkmodel.User) []interface{} {
+	return []interface{}{
+		u.ProjectID, u.UserID, u.Email, u.Name, u.FirstName, u.LastName, u.Phone, u.Avatar,
+		u.PropertiesString(), u.GroupID1, u.GroupID2, u.GroupID3, u.GroupID4, u.GroupID5, u.GroupID6,
+		u.SdkEdition, u.SdkVersion, u.CurrentUrl, u.InitialRef, u.RefDomain,
+		u.UtmSource, u.UtmMedium, u.UtmCampaign, u.Country, u.State, u.City, u.OrApiEndpoint,
+		u.CreatedAt, u.FirstEventAt, u.LastSeen, noDeleteTime, uint8(0),
+	}
+}
+
+func (c *connectorImpl) InsertUser(u *sdkmodel.User) error {
+	if err := c.appendTo("pa_users", UserRow(u)...); err != nil {
+		c.checkError("pa_users", err)
+		return fmt.Errorf("can't append to pa_users batch: %s", err)
+	}
+	return nil
+}
+
+func UserTombstoneRow(projectID uint16, userID string) []interface{} {
+	now := time.Now()
+	return []interface{}{
+		projectID, userID, "", "", "", "", "", "",
+		"{}", []string{}, []string{}, []string{}, []string{}, []string{}, []string{},
+		"", "", "", "", "", "", "", "", "", "", "", "",
+		now, now, now, now, uint8(1),
+	}
+}
+
+func (c *connectorImpl) InsertUserTombstone(projectID uint16, userID string) error {
+	if err := c.appendTo("pa_users", UserTombstoneRow(projectID, userID)...); err != nil {
+		c.checkError("pa_users", err)
+		return fmt.Errorf("can't append to pa_users batch: %s", err)
+	}
+	return nil
+}
+
+func (c *connectorImpl) InsertUserDistinctID(projectID uint16, distinctID, userID string) error {
+	if err := c.appendTo("pa_users_distinct_id", projectID, distinctID, userID); err != nil {
+		c.checkError("pa_users_distinct_id", err)
+		return fmt.Errorf("can't append to pa_users_distinct_id batch: %s", err)
+	}
+	return nil
 }

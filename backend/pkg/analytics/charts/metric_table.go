@@ -427,8 +427,6 @@ LIMIT %d OFFSET %d;`,
 		)
 	}
 
-	logQuery(fmt.Sprintf("TableQueryBuilder.buildQuery: %s", query))
-
 	params := map[string]any{
 		"projectId":      r.ProjectId,
 		"startTimestamp": r.StartTimestamp,
@@ -614,9 +612,11 @@ func (t *TableQueryBuilder) buildPrewhereConditions(r *Payload, eventsOrder mode
 // The list of session properties and its column names
 var sessionProperties = map[string]string{
 	"user_os":              "user_os",
+	"user_os_version":      "user_os_version",
 	"user_browser":         "user_browser",
 	"user_browser_version": "user_browser_version",
 	"user_device":          "user_device",
+	"user_device_type":     "user_device_type",
 	"user_country":         "user_country",
 	"user_city":            "user_city",
 	"user_state":           "user_state",
@@ -649,7 +649,6 @@ func (t *TableQueryBuilder) buildSessionConditions(r *Payload, metricFormat stri
 
 	// Add core session conditions
 	sessionConditions = append(sessionConditions, t.buildTimeRangeConditions("s")...)
-	sessionConditions = append(sessionConditions, "isNotNull(s.duration)")
 
 	// Add duration conditions
 	for _, durCond := range durConds {
@@ -674,7 +673,7 @@ func (t *TableQueryBuilder) buildSessionConditions(r *Payload, metricFormat stri
 			var subCondition []string
 			if column, ok := sessionProperties[f.Name]; ok {
 				subCondition = append(subCondition, buildCond(column, f.Value, f.Operator, false, "singleColumn"))
-			} else if strings.HasPrefix(f.Name, "metadata_") {
+			} else if IsMetadataColumn(f.Name) {
 				subCondition = append(subCondition, buildCond(f.Name, f.Value, f.Operator, false, "singleColumn"))
 			}
 			if len(subCondition) > 0 {

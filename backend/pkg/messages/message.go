@@ -45,6 +45,10 @@ func (b *BatchInfo) ID() uint64 {
 	return b.id
 }
 
+func (b *BatchInfo) Topic() string {
+	return b.topic
+}
+
 func (b *BatchInfo) Timestamp() int64 {
 	return b.timestamp
 }
@@ -101,6 +105,10 @@ func (m *message) Batch() *BatchInfo {
 
 func (m *message) Meta() *message {
 	return m
+}
+
+func HasMeta(m Message) bool {
+	return m.Meta().batch != nil
 }
 
 func (m *message) SetMeta(origin *message) {

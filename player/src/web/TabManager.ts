@@ -74,6 +74,9 @@ export default class TabSessionManager {
 
   private pagesManager: PagesManager;
 
+  /** Node ids announced so far on the current page; 0 is the CreateDocument root. */
+  private knownNodeIds: Set<number> = new Set([0]);
+
   private scrollManager: ListWalker<SetViewportScroll> = new ListWalker();
 
   public readonly decoder = new Decoder();
@@ -115,13 +118,7 @@ export default class TabSessionManager {
       screen,
       this.session.isMobile,
       this.setCSSLoading,
-      () => {
-        setTimeout(() => {
-          this.state.update({
-            vModeBadge: true,
-          });
-        }, 0);
-      },
+      this.showVModeBadge,
     );
     this.lists = new Lists(initialLists);
     initialLists?.event?.forEach((e: Record<string, string>) => {
@@ -142,7 +139,18 @@ export default class TabSessionManager {
 
   public getNode = (id: number) => this.pagesManager.getNode(id);
 
+  private showVModeBadge = () => {
+    setTimeout(() => {
+      this.state.update({
+        vModeBadge: true,
+      });
+    }, 0);
+  };
+
+  private spriteMapEl: SVGElement | null = null;
+
   public injectSpriteMap = (spriteMapEl: SVGElement) => {
+    this.spriteMapEl = spriteMapEl;
     this.pagesManager.injectSpriteMap(spriteMapEl);
   };
 
@@ -211,11 +219,17 @@ export default class TabSessionManager {
 
     this.performanceTrackManager = new PerformanceTrackManager();
     this.windowNodeCounter = new WindowNodeCounter();
+    this.knownNodeIds = new Set([0]);
     this.pagesManager = new PagesManager(
       this.screen,
       this.session.isMobile,
       this.setCSSLoading,
+      this.showVModeBadge,
     );
+    // Sprites live outside the message stream, so a fresh PagesManager starts without them.
+    if (this.spriteMapEl) {
+      this.pagesManager.injectSpriteMap(this.spriteMapEl);
+    }
   }
 
   firstTitleSet = false;
@@ -259,6 +273,7 @@ export default class TabSessionManager {
             [tarball, mp4file, framesFile],
             this.getNode as (id: number) => VElement | undefined,
             this.sessionStart,
+            !this.screen.scriptingEnabled,
           );
           this.canvasManagers[managerId] = {
             manager,
@@ -372,13 +387,19 @@ export default class TabSessionManager {
       default:
         switch (msg.tp) {
           case MType.CreateDocument:
+            this.knownNodeIds = new Set([0]);
             this.windowNodeCounter.reset();
             this.performanceTrackManager.setCurrentNodesCount(
               this.windowNodeCounter.count,
             );
             break;
+          case MType.CreateIFrameDocument:
+            this.knownNodeIds.add(msg.id);
+            break;
           case MType.CreateTextNode:
           case MType.CreateElementNode:
+            this.recoverSwappedRoot(msg);
+            this.knownNodeIds.add(msg.id);
             this.windowNodeCounter.addNode(msg);
             this.performanceTrackManager.setCurrentNodesCount(
               this.windowNodeCounter.count,
@@ -412,6 +433,29 @@ export default class TabSessionManager {
         isDOMType(msg.tp) && this.pagesManager.appendMessage(msg);
         break;
     }
+  }
+
+  private recoverSwappedRoot(msg: Message): void {
+    if (
+      msg.tp !== MType.CreateElementNode ||
+      msg.tag !== 'HEAD' ||
+      msg.index !== 0 ||
+      msg.parentID === 0 ||
+      this.knownNodeIds.has(msg.parentID)
+    ) {
+      return;
+    }
+    this.knownNodeIds = new Set([0, msg.parentID]);
+    this.windowNodeCounter.reset();
+    this.performanceTrackManager.setCurrentNodesCount(
+      this.windowNodeCounter.count,
+    );
+    this.pagesManager.appendMessage({
+      tp: MType.CreateDocument,
+      time: msg.time,
+      tabId: this.id,
+      rootId: msg.parentID,
+    } as unknown as Message);
   }
 
   move(t: number, index?: number, silent?: boolean): void {

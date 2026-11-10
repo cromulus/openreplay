@@ -106,6 +106,7 @@ func (h *HeatmapQueryBuilder) buildQuery(p *Payload) (string, error) {
 	if p.SampleRate > 0 && p.SampleRate < 100 {
 		base = append(base, fmt.Sprintf("e.sample_key < %d", p.SampleRate))
 	}
+	base = append(base, buildLocationConditions(filter.Filters, "e")...)
 
 	eventsWhere, filtersWhere, _, sessionsWhere := BuildWhere(filter.Filters, string(filter.EventsOrder), "l", "ls")
 
@@ -155,7 +156,6 @@ WHERE %s
 ORDER BY e.created_at
 LIMIT 500;`, where)
 
-	logQuery(fmt.Sprintf("HeatmapQueryBuilder.buildQuery: %s", q))
 	return q, nil
 }
 
@@ -221,6 +221,5 @@ WHERE %s
 ORDER BY e.created_at
 LIMIT 500;`, where)
 
-	logQuery(fmt.Sprintf("HeatmapQueryBuilder.buildClickRageQuery: %s", q))
 	return q, nil
 }

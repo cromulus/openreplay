@@ -1,18 +1,18 @@
 import logging
-from typing import Optional, Union
 
 from decouple import config
 from fastapi import Body, Depends, BackgroundTasks
 from fastapi import HTTPException, status
-from starlette.responses import RedirectResponse, FileResponse, JSONResponse, Response
+from starlette.responses import RedirectResponse, JSONResponse, Response
 
 import schemas
-from chalicelib.core import signup, feature_flags
 from chalicelib.core import scope
+from chalicelib.core import signup
 from chalicelib.core import tenants, users, projects, license
 from chalicelib.core import webhook
 from chalicelib.core.collaborations.collaboration_slack import Slack
 from chalicelib.core.errors import errors, errors_details
+from chalicelib.core.sessions import sessions_assignments
 from chalicelib.utils import captcha, smtp
 from chalicelib.utils import helper
 from chalicelib.utils.TimeUTC import TimeUTC
@@ -120,6 +120,8 @@ def get_account(context: schemas.CurrentContext = Depends(OR_context)):
         t = dict(t)
         t["createdAt"] = TimeUTC.datetime_to_timestamp(t["createdAt"])
         t["tenantName"] = t.pop("name")
+        if not r["admin"] and not r["superAdmin"]:
+            t.pop("apiKey", None)
     else:
         return {"errors": ["current tenant not found"]}
 
@@ -139,7 +141,7 @@ def edit_account(data: schemas.EditAccountSchema = Body(...),
     return users.edit_account(tenant_id=context.tenant_id, user_id=context.user_id, changes=data)
 
 
-@app.post('/account/scope', tags=["account"])
+@app.post('/account/scope', tags=["account"], dependencies=[OR_role("owner", "admin")])
 def change_scope(data: schemas.ScopeSchema = Body(),
                  context: schemas.CurrentContext = Depends(OR_context)):
     data = scope.update_scope(tenant_id=-1, scope=data.scope)
@@ -248,6 +250,44 @@ def get_error_trace(projectId: int, sessionId: int, errorId: str,
     }
 
 
+@app.get('/{projectId}/sessions/{sessionId}/assign', tags=["sessions"])
+def get_session_assignments(projectId: int, sessionId: int, context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions_assignments.get_by_session(project_id=projectId, session_id=sessionId,
+                                               tenant_id=context.tenant_id,
+                                               user_id=context.user_id)
+    if "errors" in data:
+        return data
+    return {
+        'data': data
+    }
+
+
+@app.get('/{projectId}/sessions/{sessionId}/assign/{issueId}', tags=["sessions", "issueTracking"])
+def get_session_assignment(projectId: int, sessionId: int, issueId: str,
+                           context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions_assignments.get(project_id=projectId, session_id=sessionId, assignment_id=issueId,
+                                    tenant_id=context.tenant_id, user_id=context.user_id)
+    if "errors" in data:
+        return data
+    return {
+        'data': data
+    }
+
+
+@app.post('/{projectId}/sessions/{sessionId}/assign/{issueId}/comment', tags=["sessions", "issueTracking"])
+def comment_assignment(projectId: int, sessionId: int, issueId: str,
+                       data: schemas.CommentAssignmentSchema = Body(...),
+                       context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions_assignments.comment(tenant_id=context.tenant_id, project_id=projectId,
+                                        session_id=sessionId, assignment_id=issueId,
+                                        user_id=context.user_id, message=data.message)
+    if "errors" in data.keys():
+        return data
+    return {
+        'data': data
+    }
+
+
 @app.get('/{projectId}/errors/{errorId}', tags=['errors'])
 def errors_get_details(projectId: int, errorId: str, density24: int = 24, density30: int = 30,
                        context: schemas.CurrentContext = Depends(OR_context)):
@@ -275,40 +315,3 @@ def get_errors_sessions(projectId: int, errorId: str,
     return {
         "data": errors.get_sessions(project_id=projectId, user_id=context.user_id, error_id=errorId,
                                     start_date=startDate, end_date=endDate)}
-
-
-@app.post('/{project_id}/feature-flags/search', tags=["feature flags"])
-def search_feature_flags(project_id: int,
-                         data: schemas.SearchFlagsSchema = Body(...),
-                         context: schemas.CurrentContext = Depends(OR_context)):
-    return feature_flags.search_feature_flags(project_id=project_id, user_id=context.user_id, data=data)
-
-
-@app.get('/{project_id}/feature-flags/{feature_flag_id}', tags=["feature flags"])
-def get_feature_flag(project_id: int, feature_flag_id: int):
-    return feature_flags.get_feature_flag(project_id=project_id, feature_flag_id=feature_flag_id)
-
-
-@app.post('/{project_id}/feature-flags', tags=["feature flags"])
-def add_feature_flag(project_id: int, data: schemas.FeatureFlagSchema = Body(...),
-                     context: schemas.CurrentContext = Depends(OR_context)):
-    return feature_flags.create_feature_flag(project_id=project_id, user_id=context.user_id, feature_flag_data=data)
-
-
-@app.put('/{project_id}/feature-flags/{feature_flag_id}', tags=["feature flags"])
-def update_feature_flag(project_id: int, feature_flag_id: int, data: schemas.FeatureFlagSchema = Body(...),
-                        context: schemas.CurrentContext = Depends(OR_context)):
-    return feature_flags.update_feature_flag(project_id=project_id, feature_flag_id=feature_flag_id,
-                                             user_id=context.user_id, feature_flag=data)
-
-
-@app.delete('/{project_id}/feature-flags/{feature_flag_id}', tags=["feature flags"])
-def delete_feature_flag(project_id: int, feature_flag_id: int, _=Body(None)):
-    return {"data": feature_flags.delete_feature_flag(project_id=project_id, feature_flag_id=feature_flag_id)}
-
-
-@app.post('/{project_id}/feature-flags/{feature_flag_id}/status', tags=["feature flags"])
-def update_feature_flag_status(project_id: int, feature_flag_id: int,
-                               data: schemas.FeatureFlagStatus = Body(...)):
-    return {"data": feature_flags.update_feature_flag_status(project_id=project_id, feature_flag_id=feature_flag_id,
-                                                             is_active=data.is_active)}

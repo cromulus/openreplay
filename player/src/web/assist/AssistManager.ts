@@ -25,6 +25,15 @@ export enum ConnectionStatus {
   Closed,
 }
 
+/**
+ * State of the tracker-side session view confirmation
+ * (tracker-assist requestConfirm option)
+ */
+export enum SessionConfirmStatus {
+  None,
+  Requesting,
+}
+
 type StatsEvent =
   | 's_call_started'
   | 's_call_ended'
@@ -67,6 +76,7 @@ export default class AssistManager {
   static readonly INITIAL_STATE = {
     peerConnectionStatus: ConnectionStatus.Connecting,
     assistStart: 0,
+    sessionConfirmation: SessionConfirmStatus.None,
     ...Call.INITIAL_STATE,
     ...RemoteControl.INITIAL_STATE,
     ...ScreenRecording.INITIAL_STATE,
@@ -279,12 +289,20 @@ export default class AssistManager {
       const { currentTab } = this.store.get();
 
       this.clearDisconnectTimeout();
-      !this.inactiveTimeout && this.setStatus(ConnectionStatus.Connected);
+      // session metadata alone doesn't mean the replay stream started: the
+      // tracker sends UPDATE_SESSION while still waiting for the user to
+      // approve session viewing (requestConfirm), and flipping to Connected
+      // there would show an empty screen instead of the pending state
+      if (!waitingForMessages && !this.inactiveTimeout) {
+        this.setStatus(ConnectionStatus.Connected);
+      }
 
       if (typeof active === 'boolean') {
         this.clearInactiveTimeout();
         if (active) {
-          this.setStatus(ConnectionStatus.Connected);
+          if (!waitingForMessages) {
+            this.setStatus(ConnectionStatus.Connected);
+          }
           this.inactiveTabs = this.inactiveTabs.filter((t) => t !== tabId);
         } else {
           if (!this.inactiveTabs.includes(tabId)) {
@@ -307,6 +325,18 @@ export default class AssistManager {
         );
         this.agentIds = filteredAgentIds;
       }
+    });
+    socket.on('session_confirm_pending', () => {
+      this.store.update({
+        sessionConfirmation: SessionConfirmStatus.Requesting,
+      });
+    });
+    socket.on('session_confirm_accepted', () => {
+      this.store.update({ sessionConfirmation: SessionConfirmStatus.None });
+    });
+    socket.on('session_confirm_rejected', () => {
+      this.store.update({ sessionConfirmation: SessionConfirmStatus.None });
+      this.uiErrorHandler?.error('User denied the live session view request');
     });
     socket.on('SESSION_DISCONNECTED', (e) => {
       waitingForMessages = true;

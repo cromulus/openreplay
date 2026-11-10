@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import Openreplay from '@openreplay/react-native';
 import { OR_PROJECT_KEY, OR_INGEST_URL } from '@env';
+import { SanitizedViewLayoutRepro } from './Example';
 
 function Section({
   title,
@@ -41,13 +42,16 @@ function ActionButton({
 }
 
 export default function App() {
-  const [inputValue, onChangeInput] = React.useState('');
   const [status, setStatus] = React.useState('Not started');
+  const [reproVisible, setReproVisible] = React.useState(false);
 
+  const projectKey = OR_PROJECT_KEY || 'YOUR_PROJECT_KEY';
+  const ingestUrl = OR_INGEST_URL || 'https://ingest.openreplay.com';
+  console.log('starting with', OR_PROJECT_KEY, OR_INGEST_URL);
   const start = () => {
     try {
       Openreplay.tracker.startSession(
-        OR_PROJECT_KEY,
+        projectKey,
         {
           crashes: true,
           analytics: true,
@@ -60,7 +64,7 @@ export default function App() {
           screenshotFrequency: 'low',
           screenshotQuality: 'standard',
         },
-        OR_INGEST_URL
+        ingestUrl
       );
       Openreplay.patchNetwork(global, () => false, { capturePayload: true });
       setStatus('Session started');
@@ -197,13 +201,14 @@ export default function App() {
         </Section>
 
         <Section title="Input Tracking">
+          {/*
+            ORTrackedInput is a bare native text field, not a TextInput - it is
+            uncontrolled and only `placeholder` and `trackingLabel` are wired.
+          */}
           <Openreplay.ORTrackedInput
             style={styles.input}
-            onChangeText={onChangeInput}
-            value={inputValue}
             placeholder="Type here (tracked)"
             trackingLabel="Search Field"
-            numberOfLines={1}
           />
         </Section>
 
@@ -213,7 +218,19 @@ export default function App() {
             <Text style={styles.sensitiveText}>Sensitive: SSN 123-45-6789</Text>
           </Openreplay.ORSanitizedView>
         </Section>
+
+        <Section title="Sanitization Layout Repro">
+          <ActionButton
+            label="Open layout repro sheet"
+            onPress={() => setReproVisible(true)}
+          />
+        </Section>
       </ScrollView>
+
+      <SanitizedViewLayoutRepro
+        visible={reproVisible}
+        onClose={() => setReproVisible(false)}
+      />
     </Openreplay.ORTouchTrackingView>
   );
 }

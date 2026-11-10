@@ -3,13 +3,6 @@ import { jest, describe, test, expect, beforeEach, afterEach } from '@jest/globa
 import Batcher from '../batcher.js'
 import { categories } from '../types.js'
 
-jest.mock('../types.js', () => ({
-  categories: {
-    people: 'people',
-    events: 'events',
-  },
-}))
-
 describe('Batcher', () => {
   let backendUrl: string
   let getToken: jest.Mock
@@ -29,21 +22,24 @@ describe('Batcher', () => {
       ok: true,
       status: 200,
     } as any)
-    global.fetch = fetchMock as any
+    globalThis.fetch = fetchMock as any
 
-    batcher = new Batcher(backendUrl, getToken, init)
+    batcher = new Batcher(backendUrl, getToken, init, true)
   })
 
   afterEach(() => {
+    batcher.stop()
+    jest.clearAllTimers()
     jest.useRealTimers()
     jest.resetAllMocks()
-    delete (global as any).fetch
+    delete (globalThis as any).fetch
   })
 
-  const makePeopleEvent = (type: string, timestamp: number, payload: any) => ({
+  const makePeopleEvent = (type: string, timestamp: number, payload: any, user_id?: string) => ({
     category: categories.people,
     data: {
       type,
+      user_id,
       timestamp,
       payload,
     },
@@ -129,6 +125,82 @@ describe('Batcher', () => {
     })
   })
 
+  test('squashing keeps user_id so the backend does not drop the merged action', () => {
+    // https://github.com/openreplay/openreplay/issues/4879
+    batcher.addEvent(makePeopleEvent('set_property', 1, { a: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property', 2, { b: 2 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property_once', 3, { c: 3 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property_once', 4, { d: 4 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('increment_property', 5, { score: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('increment_property', 6, { score: 2 }, 'visitor-a'))
+
+    const peopleBatch = batcher.getBatches().data[categories.people]
+
+    expect(peopleBatch).toEqual([
+      { type: 'set_property', user_id: 'visitor-a', timestamp: 2, payload: { a: 1, b: 2 } },
+      { type: 'set_property_once', user_id: 'visitor-a', timestamp: 4, payload: { c: 3, d: 4 } },
+      { type: 'increment_property', user_id: 'visitor-a', timestamp: 6, payload: { score: 3 } },
+    ])
+  })
+
+  test('squashed set_property_once keeps the first value for a repeated key', () => {
+    batcher.addEvent(makePeopleEvent('set_property_once', 1, { plan: 'free', a: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property_once', 2, { plan: 'pro', b: 2 }, 'visitor-a'))
+
+    const peopleBatch = batcher.getBatches().data[categories.people]
+
+    expect(peopleBatch).toEqual([
+      {
+        type: 'set_property_once',
+        user_id: 'visitor-a',
+        timestamp: 2,
+        payload: { plan: 'free', a: 1, b: 2 },
+      },
+    ])
+  })
+
+  test('user_id survives the serialized flush body', () => {
+    batcher.addEvent(makePeopleEvent('set_property', 1, { a: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property', 2, { b: 2 }, 'visitor-a'))
+
+    batcher.flush()
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+
+    expect(body.data[categories.people]).toEqual([
+      { type: 'set_property', user_id: 'visitor-a', timestamp: 2, payload: { a: 1, b: 2 } },
+    ])
+  })
+
+  test('mutations for different users are not squashed together', () => {
+    batcher.addEvent(makePeopleEvent('set_property', 1, { a: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('set_property', 2, { b: 2 }, 'visitor-b'))
+    batcher.addEvent(makePeopleEvent('set_property', 3, { a: 9 }, 'visitor-a'))
+
+    const peopleBatch = batcher.getBatches().data[categories.people]
+
+    expect(peopleBatch).toEqual([
+      { type: 'set_property', user_id: 'visitor-a', timestamp: 3, payload: { a: 9 } },
+      { type: 'set_property', user_id: 'visitor-b', timestamp: 2, payload: { b: 2 } },
+    ])
+  })
+
+  test('identity events keep their user_id and still split the batch', () => {
+    batcher.addEvent(makePeopleEvent('set_property', 1, { a: 1 }, 'visitor-a'))
+    batcher.addEvent(makePeopleEvent('identity', 2, undefined, 'visitor-b'))
+    batcher.addEvent(makePeopleEvent('set_property', 3, { b: 2 }, 'visitor-b'))
+    batcher.addEvent(makePeopleEvent('set_property', 4, { c: 3 }, 'visitor-b'))
+
+    const peopleBatch = batcher.getBatches().data[categories.people]
+
+    expect(peopleBatch).toEqual([
+      { type: 'set_property', user_id: 'visitor-a', timestamp: 1, payload: { a: 1 } },
+      { type: 'identity', user_id: 'visitor-b', timestamp: 2, payload: undefined },
+      { type: 'set_property', user_id: 'visitor-b', timestamp: 4, payload: { b: 2, c: 3 } },
+    ])
+  })
+
   test('sendImmediately posts single event batch and does not touch stored batch', () => {
     const pe = makePeopleEvent('set_property', 1, { a: 1 })
     batcher.addEvent(pe)
@@ -159,13 +231,59 @@ describe('Batcher', () => {
     expect(batches.data[categories.events]).toHaveLength(0)
   })
 
-  test('sendImmediately does nothing when token is null', () => {
+  test('sendImmediately without a token keeps the event for the next flush', () => {
     getToken.mockReturnValueOnce(null)
 
-    const ev = makePeopleEvent('set_property', 1, { a: 1 })
-    batcher.sendImmediately(ev)
-
+    batcher.sendImmediately(makeEventsEvent('instant', 1, { v: 1 }))
     expect(fetchMock).not.toHaveBeenCalled()
+
+    batcher.flush()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.data[categories.events]).toEqual([{ name: 'instant', payload: { v: 1 }, timestamp: 1 }])
+  })
+
+  test('appends to the same key are not squashed into one value', () => {
+    batcher.addEvent(makePeopleEvent('append_property', 1, { tags: 'a' }, 'u1'))
+    batcher.addEvent(makePeopleEvent('append_property', 2, { tags: 'b' }, 'u1'))
+    batcher.addEvent(makePeopleEvent('append_unique_property', 3, { tags: 'c' }, 'u1'))
+    batcher.addEvent(makePeopleEvent('append_unique_property', 4, { tags: 'd' }, 'u1'))
+
+    expect(batcher.getBatches().data[categories.people]).toEqual([
+      { type: 'append_property', user_id: 'u1', timestamp: 1, payload: { tags: 'a' } },
+      { type: 'append_property', user_id: 'u1', timestamp: 2, payload: { tags: 'b' } },
+      { type: 'append_unique_property', user_id: 'u1', timestamp: 3, payload: { tags: 'c' } },
+      { type: 'append_unique_property', user_id: 'u1', timestamp: 4, payload: { tags: 'd' } },
+    ])
+  })
+
+  test('squashing does not move a mutation ahead of a different one on the same key', () => {
+    batcher.addEvent(makePeopleEvent('set_property', 1, { plan: 'free', count: 1 }, 'u1'))
+    batcher.addEvent(makePeopleEvent('increment_property', 2, { count: 2 }, 'u1'))
+    batcher.addEvent(makePeopleEvent('set_property', 3, { count: 0 }, 'u1'))
+    batcher.addEvent(makePeopleEvent('increment_property', 4, { count: 5 }, 'u1'))
+
+    expect(batcher.getBatches().data[categories.people]).toEqual([
+      { type: 'set_property', user_id: 'u1', timestamp: 1, payload: { plan: 'free', count: 1 } },
+      { type: 'increment_property', user_id: 'u1', timestamp: 2, payload: { count: 2 } },
+      { type: 'set_property', user_id: 'u1', timestamp: 3, payload: { count: 0 } },
+      { type: 'increment_property', user_id: 'u1', timestamp: 4, payload: { count: 5 } },
+    ])
+  })
+
+  test('squashing still merges past mutations on other keys or users', () => {
+    batcher.addEvent(makePeopleEvent('set_property', 1, { plan: 'free' }, 'u1'))
+    batcher.addEvent(makePeopleEvent('increment_property', 2, { count: 2 }, 'u1'))
+    batcher.addEvent(makePeopleEvent('append_property', 3, { tags: 'a' }, 'u1'))
+    batcher.addEvent(makePeopleEvent('set_property', 4, { plan: 'x' }, 'u2'))
+    batcher.addEvent(makePeopleEvent('set_property', 5, { plan: 'pro' }, 'u1'))
+
+    expect(batcher.getBatches().data[categories.people]).toEqual([
+      { type: 'set_property', user_id: 'u1', timestamp: 5, payload: { plan: 'pro' } },
+      { type: 'increment_property', user_id: 'u1', timestamp: 2, payload: { count: 2 } },
+      { type: 'append_property', user_id: 'u1', timestamp: 3, payload: { tags: 'a' } },
+      { type: 'set_property', user_id: 'u2', timestamp: 4, payload: { plan: 'x' } },
+    ])
   })
 
   test('sendBatch called via flush posts all events and then clears batches', () => {
@@ -232,18 +350,95 @@ describe('Batcher', () => {
     expect(flushSpy).toHaveBeenCalledTimes(1)
   })
 
-  test('403 response triggers init()', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-    } as any)
+  test('403 response re-inits and resends the same body', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 403 } as any)
 
-    const ev = makeEventsEvent('evt', 1, {})
-    batcher.sendImmediately(ev)
-
-    await Promise.resolve()
+    batcher.sendImmediately(makeEventsEvent('evt', 1, {}))
+    await jest.runAllTimersAsync()
 
     expect(init).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][1].body).toBe(fetchMock.mock.calls[0][1].body)
+  })
+
+  test('network errors are retried 3 times, then events go back ahead of newer ones', async () => {
+    fetchMock.mockRejectedValue(new Error('offline'))
+    batcher.addEvent(makeEventsEvent('first', 1, {}))
+    batcher.flush()
+    batcher.addEvent(makeEventsEvent('second', 2, {}))
+
+    await Promise.resolve()
+    await Promise.resolve()
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(2999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await jest.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await jest.advanceTimersByTimeAsync(10000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    expect(batcher.getBatches().data[categories.events].map((e) => e.name)).toEqual([
+      'first',
+      'second',
+    ])
+  })
+
+  test('401 token expired stops a non-standalone batcher', async () => {
+    batcher = new Batcher(backendUrl, getToken, init, false)
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: () => Promise.resolve({ error: 'token expired' }),
+    } as any)
+
+    batcher.addEvent(makeEventsEvent('evt', 1, {}))
+    batcher.flush()
+    await jest.runAllTimersAsync()
+
+    expect(init).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    batcher.addEvent(makeEventsEvent('later', 2, {}))
+    batcher.flush()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('401 token expired re-inits in standalone mode', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: () => Promise.resolve({ error: 'token expired' }),
+    } as any)
+
+    batcher.sendImmediately(makeEventsEvent('evt', 1, {}))
+    await jest.runAllTimersAsync()
+
+    expect(init).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('hiding the tab flushes with keepalive and pauses autosend', () => {
+    const hidden = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden')
+    let isHidden = false
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => isHidden })
+    try {
+      batcher.startAutosend()
+      batcher.addEvent(makeEventsEvent('evt', 1, {}))
+
+      isHidden = true
+      document.dispatchEvent(new Event('visibilitychange'))
+
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock.mock.calls[0][1].keepalive).toBe(true)
+
+      batcher.addEvent(makeEventsEvent('while-hidden', 2, {}))
+      jest.advanceTimersByTime(5000)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    } finally {
+      delete (document as any).hidden
+      if (hidden) Object.defineProperty(Document.prototype, 'hidden', hidden)
+    }
   })
 })

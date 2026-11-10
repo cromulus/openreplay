@@ -220,23 +220,23 @@ svg {
 }
 
 .dateRangeContainer  .react-calendar__tile--active{
-    background-color: rgba(57, 77, 254,.7);
-    color: #FFF!important;
+    background-color: color-mix(in srgb, var(--color-teal) 70%, transparent);
+    color: var(--color-white)!important;
 }
 
 .dateRangeContainer .react-calendar__tile--rangeStart {
-    background-color: #394dfe;
-    color: #FFF!important;
+    background-color: var(--color-teal);
+    color: var(--color-white)!important;
 }
 
 .dateRangeContainer .react-calendar__tile--hasActive, .dateRangeContainer .react-calendar__tile--active:hover, .dateRangeContainer .react-calendar__tile--active:enabled:hover, .dateRangeContainer .react-calendar__tile--active:enabled:focus, .dateRangeContainer  .react-calendar__tile--hasActive:enabled:hover, .dateRangeContainer  .react-calendar__tile--hasActive:enabled:focus{
-    background-color: #394dfe;
-    color: #FFF!important;
+    background-color: var(--color-teal);
+    color: var(--color-white)!important;
 }
 
 .react-calendar__tile--now:enabled:hover, .react-calendar__tile--now:enabled:focus {
-    background-color: #2331A8!important;
-    color: #FFF!important;
+    background-color: var(--color-teal-dark)!important;
+    color: var(--color-white)!important;
 }
 
 .dateRangePopup-module__wrapper {
@@ -244,7 +244,7 @@ svg {
 }
 
 .dateRangeContainer .react-calendar__tile--hasActive:hover{
-    background-color: #394dfe;
+    background-color: var(--color-teal);
     cursor: default;
 }
 
@@ -450,6 +450,17 @@ svg {
     max-width: 640px;
 }
 
-.ant-select-input:focus {
-    border:none!important;
+/* Kill the Select focus ring. It's a box-shadow on .ant-select-selector (not a
+   border/outline on the inner search input), so clear box-shadow there; also reset the
+   input's own outline for good measure. */
+.ant-select-focused .ant-select-selector,
+.ant-select .ant-select-selector:focus-within {
+    border-color: var(--color-gray-light)!important;
+    box-shadow: none!important;
+    outline: none!important;
+}
+.ant-select-input:focus,
+.ant-select-input:focus-visible {
+    outline: none!important;
+    box-shadow: none!important;
 }

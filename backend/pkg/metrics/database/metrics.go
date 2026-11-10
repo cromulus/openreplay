@@ -4,6 +4,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+const (
+	MessageSaved     = "saved"
+	MessageError     = "error"
+	MessageDuplicate = "duplicate"
+	MessageNoSession = "no_session"
+)
+
 type Database interface {
 	RecordBatchElements(number float64)
 	RecordBatchInsertDuration(durMillis float64)
@@ -13,6 +20,12 @@ type Database interface {
 	IncreaseTotalRequests(method, table string)
 	IncreaseRedisRequests(method, table string)
 	RecordRedisRequestDuration(durMillis float64, method, table string)
+	IncreaseSaverMessages(platform, outcome string)
+	RecordBulkDroppedRows(size float64, db, table string)
+	IncreaseBulkSendRetries(db, table string)
+	RecordCHQueueDepth(size float64)
+	IncreaseUserConflicts()
+	IncreaseUserStateFallbacks()
 	List() []prometheus.Collector
 }
 
@@ -29,3 +42,9 @@ func (d *databaseImpl) RecordRequestDuration(durMillis float64, method, table st
 func (d *databaseImpl) IncreaseTotalRequests(method, table string)                         {}
 func (d *databaseImpl) IncreaseRedisRequests(method, table string)                         {}
 func (d *databaseImpl) RecordRedisRequestDuration(durMillis float64, method, table string) {}
+func (d *databaseImpl) IncreaseSaverMessages(platform, outcome string)                     {}
+func (d *databaseImpl) RecordBulkDroppedRows(size float64, db, table string)               {}
+func (d *databaseImpl) IncreaseBulkSendRetries(db, table string)                           {}
+func (d *databaseImpl) RecordCHQueueDepth(size float64)                                    {}
+func (d *databaseImpl) IncreaseUserConflicts()                                             {}
+func (d *databaseImpl) IncreaseUserStateFallbacks()                                        {}

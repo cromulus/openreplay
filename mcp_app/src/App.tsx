@@ -16,13 +16,12 @@ function App() {
   const { state, setState, handleToolResult } = useOpenReplayApp();
   const [appReady, setAppReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [jwt, setJwt] = useState('');
   const [appUrl, setAppUrl] = useState('https://app.openreplay.com');
 
   const { app, isConnected, error: appError } = useApp({
     appInfo: {
       name: 'OpenReplay Viewer',
-      version: '1.0.0',
+      version: __APP_VERSION__,
     },
     capabilities: {},
     onAppCreated: async (createdApp) => {
@@ -80,7 +79,12 @@ function App() {
     async (req: { name: string; arguments: Record<string, unknown> }) => {
       if (!app) throw new Error('App not initialized');
       const result = await app.callServerTool(req);
-      await handleToolResult(result, app);
+      // Hand the call back as a retry thunk so an auth failure can be replayed
+      // once the user logs in.
+      await handleToolResult(result, app, async () => {
+        const retried = await app.callServerTool(req);
+        await handleToolResult(retried, app);
+      });
       return result;
     },
     [app, handleToolResult],
@@ -90,50 +94,6 @@ function App() {
   useHostStyles(app);
   useHostStyleVariables(app);
   useAutoResize(app);
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-
-    try {
-      if (!app) throw new Error('App not initialized');
-
-      await logger.info('Attempting login...');
-
-      // Update OpenReplay URL
-      await app.callServerTool({
-        name: 'configure_backend',
-        arguments: { appUrl },
-      });
-
-      // Login with JWT
-      await app.callServerTool({
-        name: 'login_jwt',
-        arguments: { jwt },
-      });
-
-      await logger.info('Login successful');
-
-      // Close the overlay
-      setState(prev => ({
-        ...prev,
-        showAuthOverlay: false,
-        authError: null,
-      }));
-
-      // Retry the last failed request if there was one
-      if (state.lastFailedRequest) {
-        await state.lastFailedRequest();
-        setState(prev => ({ ...prev, lastFailedRequest: null }));
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Login failed';
-      await logger.error(`Login failed: ${errorMsg}`);
-      setState(prev => ({
-        ...prev,
-        authError: errorMsg,
-      }));
-    }
-  };
 
   const parseToolResult = (result: any): any => {
     const firstContent = result?.content?.[0];
@@ -259,11 +219,8 @@ function App() {
       {state.showAuthOverlay && (
         <AuthOverlay
           authError={state.authError}
-          jwt={jwt}
-          setJwt={setJwt}
           appUrl={appUrl}
           setAppUrl={setAppUrl}
-          onSubmit={handleLogin}
           onBrowserLogin={handleBrowserLogin}
         />
       )}
@@ -306,6 +263,7 @@ function App() {
             duration={state.replayData.duration}
             sessionId={state.replayData.sessionId}
             siteId={state.replayData.siteId}
+            fileKey={state.replayData.fileKey}
             callServerTool={callServerTool}
             app={app}
             onBack={

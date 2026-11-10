@@ -9,7 +9,10 @@ export const CLIENT_TABS = {
   WEBHOOKS: 'webhooks',
   NOTIFICATIONS: 'notifications',
   AUDIT: 'audit',
-  BILLING: '$_this_url_does_not_exist',
+  BILLING: 'billing',
   MODULES: 'modules',
   VIDEOS: 'exported',
+  TEST_AGENTS: 'test-agents',
+  AGENTS: 'agents',
+  SUPPORT: 'support',
 };

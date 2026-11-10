@@ -1,3 +1,31 @@
+## 11.0.20
+
+- fixes towards stability of connection on restarts, page visits etc
+- `requestConfirm`: session data updates (userID, metadata, page title, tab
+  activity) are no longer suppressed while waiting for the user's approval;
+  only replay messages, calls, remote control and canvas streams are held back
+
+## 11.0.19
+
+- add an option to require user permission to view assist session
+- `requestConfirm` option: require user confirmation before anything is sent to agents; popup shown when first agent connects, approval remembered per-tab until `stop()`
+- `sessionConfirm` option to customize the confirmation popup text/style
+- `onSessionConfirmApprove`/`onSessionConfirmDeny` callbacks
+
+## 11.0.18
+
+- autostart options
+- start/stop methods
+- options to ignore anonymous sessions
+
+## 11.0.17
+
+- improvements for rc interaction with select els
+
+## 11.0.16
+
+fixes for possible memory leaks and remote control safety
+
 ## 11.0.13
 
 - prevent disconnects on page reload

@@ -81,12 +81,12 @@ func main() {
 		log.Fatal(ctx, "can't init project service: %s", err)
 	}
 
-	users, err := sdk.NewUsers(log, chConn, sessManager)
+	users, err := sdk.NewUsers(log, chConn, chConnector, sessManager, dbMetric, redisConn, cfg.PAUserStateTTL)
 	if err != nil {
 		log.Fatal(ctx, "can't init users: %s", err)
 	}
 
-	saver := datasaver.New(log, cfg, chConnector, sessManager, issuesManager, tagsManager, canvases, users)
+	saver := datasaver.New(log, cfg, chConnector, sessManager, issuesManager, tagsManager, canvases, users, dbMetric)
 
 	msgFilter := []int{
 		// Web messages
@@ -95,7 +95,6 @@ func main() {
 		messages.MsgJSException, messages.MsgResourceTiming, messages.MsgCustomEvent, messages.MsgCustomIssue,
 		messages.MsgNetworkRequest, messages.MsgGraphQL, messages.MsgStateAction, messages.MsgMouseClick,
 		messages.MsgMouseClickDeprecated, messages.MsgSetPageLocation, messages.MsgSetPageLocationDeprecated,
-		messages.MsgPageLoadTiming, messages.MsgPageRenderTiming,
 		messages.MsgPageEvent, messages.MsgPageEventDeprecated, messages.MsgMouseThrashing, messages.MsgInputChange,
 		messages.MsgUnbindNodes, messages.MsgTagTrigger, messages.MsgIncident, messages.MsgCanvasNode,
 		// Mobile messages
@@ -104,6 +103,7 @@ func main() {
 		messages.MsgMobileClickEvent, messages.MsgMobileSwipeEvent, messages.MsgMobileInputEvent,
 		messages.MsgMobileCrash, messages.MsgMobileIssueEvent,
 	}
+	msgFilter = append(msgFilter, datasaver.HeuristicsInputTypes()...)
 
 	// Init consumer
 	consumer, err := queue.NewConsumer(
@@ -135,7 +135,7 @@ func main() {
 		clickhouse.OffsetCommitter
 		SetProcessedHook(func(topic string, partition int32, offset int64))
 	}); ok {
-		chConnector.SetCommitter(oc)
+		chConnector.AddCommitter(oc)
 		oc.SetProcessedHook(chConnector.OnBatchEnd)
 	}
 	h.Register("consumer", func(ctx context.Context) error {

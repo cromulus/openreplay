@@ -1,0 +1,330 @@
+package assist
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"openreplay/backend/internal/config/api"
+	"openreplay/backend/pkg/db/postgres"
+	"openreplay/backend/pkg/logger"
+	"openreplay/backend/pkg/projects"
+)
+
+type proxyImpl struct {
+	cfg      *api.Config
+	log      logger.Logger
+	projects projects.Projects
+}
+
+func newProxy(log logger.Logger, cfg *api.Config, projects projects.Projects) (Assist, error) {
+	switch {
+	case log == nil:
+		return nil, errors.New("logger is nil")
+	case cfg == nil:
+		return nil, errors.New("config is nil")
+	case cfg.AssistUrl == "":
+		return nil, errors.New("assist url is not set")
+	case projects == nil:
+		return nil, errors.New("projects is nil")
+	}
+	return &proxyImpl{
+		log:      log,
+		cfg:      cfg,
+		projects: projects,
+	}, nil
+}
+
+// assist.get_live_session_by_id(project_id=project_id, session_id=session_id)
+func (a *proxyImpl) GetLiveSessionByID(projID uint32, sessID uint64, canCall bool) (interface{}, error) {
+	switch {
+	case projID == 0:
+		return nil, errors.New("projID is 0")
+	case sessID == 0:
+		return nil, errors.New("sessID is 0")
+	}
+
+	proj, err := a.projects.GetProject(projID)
+	if err != nil {
+		if postgres.IsNoRowsErr(err) {
+			return nil, ErrNoLiveSession
+		}
+		return nil, err
+	}
+	assistUrl := fmt.Sprintf(a.cfg.AssistUrl, a.cfg.AssistKey) + a.cfg.AssistLiveSuffix + "/" + proj.ProjectKey + "/" + strconv.Itoa(int(sessID))
+
+	resp, err := http.Get(assistUrl)
+	if err != nil {
+		return nil, fmt.Errorf("assist request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNoLiveSession
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("assist returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read assist response: %w", err)
+	}
+
+	type assistResponse struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	var response assistResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("parse assist response: %w", err)
+	}
+	if len(response.Data) == 0 {
+		return nil, ErrNoLiveSession
+	}
+
+	response.Data["live"] = true
+	if token, err := agentToken(a.cfg, projID, proj.ProjectKey, sessID, canCall); err != nil {
+		a.log.Error(context.Background(), "[proxy] GetLiveSessionByID: %v", err)
+	} else {
+		response.Data["agentToken"] = token
+	}
+	return response.Data, nil
+}
+
+// assist.get_live_sessions_ws(...)
+func (a *proxyImpl) GetLiveSessionsWS(projID uint32, req *GetLiveSessionsRequest) (interface{}, error) {
+	switch {
+	case projID == 0:
+		return nil, errors.New("projID is 0")
+	case req == nil:
+		return nil, errors.New("request body is nil")
+	}
+
+	proj, err := a.projects.GetProject(projID)
+	if err != nil {
+		return nil, err
+	}
+	assistUrl := fmt.Sprintf(a.cfg.AssistUrl, a.cfg.AssistKey) + a.cfg.AssistLiveSuffix + "/" + proj.ProjectKey
+
+	// Transformation from frontend request to assist request payload
+	payload, err := json.Marshal(req.parse())
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := a.requestAssistData(assistUrl, payload)
+	if err != nil {
+		a.log.Error(context.Background(), "Error requesting assist data: %v", err)
+		resp = map[string]interface{}{"total": 0, "sessions": []interface{}{}} // default response
+	}
+	return resp, nil
+}
+
+// assist.is_live(project_id=project_id, session_id=session_id, project_key=data["projectKey"])
+func (a *proxyImpl) IsLive(projID uint32, sessID uint64) (bool, error) {
+	switch {
+	case projID == 0:
+		return false, errors.New("projID is 0")
+	case sessID == 0:
+		return false, errors.New("sessID is 0")
+	}
+	proj, err := a.projects.GetProject(projID)
+	if err != nil {
+		return false, err
+	}
+	assistUrl := fmt.Sprintf(a.cfg.AssistUrl, a.cfg.AssistKey) + a.cfg.AssistListSuffix + "/" + proj.ProjectKey + "/" + strconv.Itoa(int(sessID))
+	resp, err := http.Get(assistUrl)
+	if err != nil {
+		fmt.Println("error making request:", err)
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("error reading response:", err)
+		return false, err
+	}
+
+	// Parse the JSON response
+	var responseData map[string]interface{}
+	err = json.Unmarshal(body, &responseData)
+	if err != nil {
+		fmt.Println("error parsing JSON response:", err)
+		return false, err
+	}
+	return false, nil
+}
+
+func (a *proxyImpl) Autocomplete(projID uint32, q, key string) ([]map[string]interface{}, error) {
+	if projID == 0 {
+		return nil, errors.New("projID is 0")
+	}
+	proj, err := a.projects.GetProject(projID)
+	if err != nil {
+		return nil, err
+	}
+	base := fmt.Sprintf(a.cfg.AssistUrl, a.cfg.AssistKey) + a.cfg.AssistListSuffix + "/" + proj.ProjectKey + "/autocomplete"
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, err
+	}
+	query := u.Query()
+	query.Set("q", q)
+	if key != "" {
+		query.Set("key", key)
+	}
+	u.RawQuery = query.Encode()
+
+	client := &http.Client{Timeout: a.cfg.AssistRequestTimeout}
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return nil, fmt.Errorf("assist autocomplete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("assist autocomplete returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read assist autocomplete response: %w", err)
+	}
+	var parsed struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse assist autocomplete response: %w", err)
+	}
+	for _, r := range parsed.Data {
+		if t, ok := r["type"].(string); ok {
+			r["type"] = changeAssistKey(t)
+		}
+	}
+	return parsed.Data, nil
+}
+
+// getAssistSessionsPayload is the wire format of the live sessions search
+// request to the assist node.js service.
+type getAssistSessionsPayload struct {
+	Filter     map[string]interface{} `json:"filter"`
+	Pagination map[string]int         `json:"pagination"`
+	Sort       map[string]string      `json:"sort"`
+}
+
+func (r *GetLiveSessionsRequest) parse() *getAssistSessionsPayload {
+	if r == nil {
+		return nil
+	}
+	res := &getAssistSessionsPayload{
+		Filter:     make(map[string]interface{}),
+		Pagination: map[string]int{"limit": r.Limit, "page": r.Page},
+		Sort:       map[string]string{"key": r.Sort, "order": r.Order},
+	}
+	for _, filter := range r.Filters {
+		f, ok := filter.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		filterType, _ := f["name"].(string) // it was 'type'
+		if strings.HasPrefix(filterType, "metadata_") {
+			filterType, _ = f["source"].(string) // temp hack with a frontend support
+		}
+		if filterType == "" {
+			continue
+		}
+		res.Filter[filterType] = map[string]interface{}{"values": f["value"], "operator": f["operator"]}
+	}
+	return res
+}
+
+func changeAssistKey(key string) string {
+	switch strings.ToUpper(key) {
+	case "PAGETITLE":
+		return "pageTitle"
+	case "ACTIVE":
+		return "active"
+	case "LIVE":
+		return "live"
+	case "SESSIONID":
+		return "sessionId"
+	case "METADATA":
+		return "metadata"
+	case "USERID":
+		return "userId"
+	case "USERUUID":
+		return "userUuid"
+	case "PROJECTKEY":
+		return "projectKey"
+	case "REVID":
+		return "revId"
+	case "TIMESTAMP":
+		return "timestamp"
+	case "TRACKERVERSION":
+		return "trackerVersion"
+	case "ISSNIPPET":
+		return "isSnippet"
+	case "USEROS":
+		return "userOs"
+	case "USERBROWSER":
+		return "userBrowser"
+	case "USERBROWSERVERSION":
+		return "userBrowserVersion"
+	case "USERDEVICE":
+		return "userDevice"
+	case "USERDEVICETYPE":
+		return "userDeviceType"
+	case "USERCOUNTRY":
+		return "userCountry"
+	case "PROJECTID":
+		return "projectId"
+	}
+	return key
+}
+
+func (a *proxyImpl) requestAssistData(assistURL string, payload []byte) (interface{}, error) {
+	assistReq, err := http.NewRequest("POST", assistURL, bytes.NewBuffer(payload))
+	if err != nil {
+		fmt.Println("Error creating request:", err)
+		return nil, err
+	}
+	assistReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: a.cfg.AssistRequestTimeout,
+	}
+	resp, err := client.Do(assistReq)
+	if err != nil {
+		fmt.Println("Error sending request:", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("HTTP error: %d %s\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Error reading response body:", err)
+		return nil, err
+	}
+
+	// Parse the JSON response
+	var responseData map[string]interface{}
+	err = json.Unmarshal(body, &responseData)
+	if err != nil {
+		fmt.Println("Error parsing JSON response:", err)
+		return nil, err
+	}
+
+	return responseData, nil
+}

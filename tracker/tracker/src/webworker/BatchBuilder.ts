@@ -28,6 +28,7 @@ export default class BatchBuilder {
   private snap: Snapshot | null = null
   private hasNonTimestamp = false
   private lastPushedTs = 0
+  private cap: number
 
   constructor(
     private readonly bufferSize: number,
@@ -35,10 +36,13 @@ export default class BatchBuilder {
     public readonly dataType: DataType,
   ) {
     this.encoder = new MessageEncoder(bufferSize)
+    this.cap = bufferSize
   }
 
-  push(msg: Message, ctx: BatchContext): boolean {
+  /** `limit` caps the batch below bufferSize for this push only. */
+  push(msg: Message, ctx: BatchContext, limit = this.bufferSize): boolean {
     const e = this.encoder
+    this.cap = Math.min(limit, this.bufferSize)
     const wasFresh = this.snap === null
     const savedOffset = e.getCurrentOffset()
     const savedCp = e.getCurrentCheckpoint()
@@ -85,6 +89,11 @@ export default class BatchBuilder {
     return this.snap !== null && this.hasNonTimestamp
   }
 
+  /** Current encoded byte size (0 when fresh). */
+  size(): number {
+    return this.snap === null ? 0 : this.encoder.getCurrentOffset()
+  }
+
   /** Returns wire bytes, or null if no real (non-Timestamp) message was pushed.
    *  Either way, the builder is reset and ready for a new batch. */
   flush(): Uint8Array | null {
@@ -97,6 +106,24 @@ export default class BatchBuilder {
     this.hasNonTimestamp = false
     this.lastPushedTs = 0
     return out
+  }
+
+  /** Bytes of a standalone batch header (BatchMetadata + Timestamp + TabData),
+   *  for repairing a batch that reached the sender without its leading metadata.
+   *  Leaves the builder empty. */
+  headerOnly(ctx: BatchContext): Uint8Array | null {
+    this.reset()
+    this.cap = this.bufferSize
+    const written = this.writeHeader({
+      pageNo: ctx.pageNo,
+      firstIndex: ctx.index,
+      timestamp: ctx.timestamp,
+      url: ctx.url,
+      tabId: ctx.tabId,
+    })
+    const out = written ? this.encoder.flush() : null
+    this.reset()
+    return out !== null && out.length > 0 ? out : null
   }
 
   /** Wipe state without emitting anything. */
@@ -120,7 +147,7 @@ export default class BatchBuilder {
     // BatchMetadata: type varint + fields (no size prefix — legacy wire format).
     if (!e.uint(batchMetadata[0])) return false
     if (!e.encode(batchMetadata as Message)) return false
-    if (e.getCurrentOffset() > this.bufferSize) return false
+    if (e.getCurrentOffset() > this.cap) return false
     e.checkpoint()
 
     if (!this.writeMessageWithSize([Messages.Type.Timestamp, snap.timestamp] as Message)) return false
@@ -142,7 +169,7 @@ export default class BatchBuilder {
       console.warn('OpenReplay: max message size overflow.')
       return false
     }
-    if (endOffset > this.bufferSize) return false
+    if (endOffset > this.cap) return false
     this.writeSizeAt(size, startOffset - SIZE_BYTES)
     e.checkpoint()
     return true

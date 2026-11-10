@@ -3,6 +3,8 @@ import cn from 'classnames';
 import React from 'react';
 import { Icon } from 'UI';
 
+import { prefetchRoute } from './prefetchRoutes';
+
 const { Text } = Typography;
 
 interface Props {
@@ -13,6 +15,12 @@ interface Props {
 }
 
 const tagClass = 'text-xs ml-2! mr-0! px-1! py-0!';
+/* antd derives a filled Tag's background from the hex it is given (l: 95%), so
+   it stays light in dark mode — read both surfaces from tokens instead */
+const tagStyle = {
+  backgroundColor: 'var(--color-tag-brand-bg)',
+  color: 'var(--color-indigo)',
+};
 
 export default function MenuContent({
   menu,
@@ -56,6 +64,7 @@ export default function MenuContent({
           if (it.key === 'exit') {
             return {
               key: it.key,
+              onMouseEnter: () => prefetchRoute(String(it.key)),
               icon: (
                 <Icon
                   name={it.icon}
@@ -75,6 +84,7 @@ export default function MenuContent({
           if (it.children) {
             return {
               key: it.key,
+              onMouseEnter: () => prefetchRoute(String(it.key)),
               icon: (
                 <Icon
                   name={it.icon}
@@ -91,6 +101,7 @@ export default function MenuContent({
                       color={it.tag.color}
                       variant={it.tag.border ? 'outlined' : 'filled'}
                       className={tagClass}
+                      style={it.tag.border ? undefined : tagStyle}
                     >
                       {it.tag.label}
                     </Tag>
@@ -104,6 +115,7 @@ export default function MenuContent({
 
                   return {
                     key: child.key,
+                    onMouseEnter: () => prefetchRoute(String(child.key)),
                     className: 'ml-8',
                     label: (
                       <div className="flex items-center gap-4 hover-fill-teal">
@@ -121,6 +133,7 @@ export default function MenuContent({
                             color={child.tag.color}
                             variant={child.tag.border ? 'outlined' : 'filled'}
                             className={tagClass}
+                            style={child.tag.border ? undefined : tagStyle}
                           >
                             {child.tag.label}
                           </Tag>
@@ -134,6 +147,7 @@ export default function MenuContent({
 
           return {
             key: it.key,
+            onMouseEnter: () => prefetchRoute(String(it.key)),
             icon: (
               <Icon
                 name={it.icon}
@@ -155,6 +169,7 @@ export default function MenuContent({
                     color={it.tag.color}
                     variant={it.tag.border ? 'outlined' : 'filled'}
                     className={tagClass}
+                    style={it.tag.border ? undefined : tagStyle}
                   >
                     {it.tag.label}
                   </Tag>

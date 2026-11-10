@@ -28,7 +28,16 @@ var (
 	sqlStringReplacer      = strings.NewReplacer(`\`, `\\`, `'`, `''`, `@`, `' || char(64) || '`)
 	sqlLikePatternReplacer = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`, `'`, `''`, `@`, `' || char(64) || '`)
 	camelToSnakeRe         = regexp.MustCompile("([a-z0-9])([A-Z])")
+	metadataColumnRe       = regexp.MustCompile(`^metadata_(?:[1-9]|10)$`)
 )
+
+// IsMetadataColumn reports whether name is a valid metadata column
+// (metadata_1 .. metadata_10). The metadata filter path splices the column
+// name directly into the SQL expression position, so it must be validated
+// against this fixed allowlist before use to prevent SQL injection.
+func IsMetadataColumn(name string) bool {
+	return metadataColumnRe.MatchString(name)
+}
 
 type Payload struct {
 	*model.MetricPayload
@@ -48,7 +57,7 @@ func NewQueryBuilder(logger logger.Logger, p *Payload, sessionConn chdb.SessionF
 		return &FunnelQueryBuilder{Logger: logger}, nil
 	case MetricTypeTable:
 		if p.MetricOf == "jsException" {
-			return &TableErrorsQueryBuilder{Logger: logger}, nil
+			return &TableErrorsQueryBuilder{Logger: logger, SessionConn: sessionConn}, nil
 		}
 		return &TableQueryBuilder{Logger: logger, SessionConn: sessionConn}, nil
 	case MetricTypeHeatmap:
@@ -151,9 +160,9 @@ func getColumnAccessor(logical string, isNumeric bool, inDProperties, inProperti
 		// JSON extraction - escape property name to prevent injection
 		escapedProp := sqlStringReplacer.Replace(propKey.LogicalProperty)
 		if isNumeric {
-			return fmt.Sprintf("JSONExtractFloat(toString(%s), '%s')", colName, escapedProp), "singleColumn"
+			return fmt.Sprintf("JSONExtractFloat(%s, '%s')", colName, escapedProp), "singleColumn"
 		}
-		return fmt.Sprintf("JSONExtractString(toString(%s), '%s')", colName, escapedProp), "singleColumn"
+		return fmt.Sprintf("JSONExtractString(%s, '%s')", colName, escapedProp), "singleColumn"
 	} else {
 		return fmt.Sprintf("%s.\"%s\"", opts.MainTableAlias, propKey.LogicalProperty), "singleColumn"
 	}
@@ -170,7 +179,7 @@ func BuildEventConditions(filters []model.Filter, option BuildConditionsOptions)
 
 	opts := BuildConditionsOptions{
 		MainTableAlias:             "e",
-		PropertiesColumnName:       "`$properties`",
+		PropertiesColumnName:       "\"$properties\"",
 		CustomPropertiesColumnName: "properties",
 		DefinedColumns:             make(map[string][]string),
 		EventsOrder:                "then",
@@ -209,7 +218,7 @@ func BuildEventConditions(filters []model.Filter, option BuildConditionsOptions)
 		}
 		isSessionProperty := false
 		_, isSessionProperty = sessionProperties[f.Name]
-		isSessionProperty = isSessionProperty || strings.HasPrefix(f.Name, "metadata_") && f.AutoCaptured
+		isSessionProperty = isSessionProperty || IsMetadataColumn(f.Name) && f.AutoCaptured
 		if f.IsEvent || !isSessionProperty {
 			if option.EventsOrder == "then" {
 				//for "then" order, we can have duplicate conditions
@@ -278,7 +287,7 @@ func addFilter(f model.Filter, opts BuildConditionsOptions, isEventProperty bool
 			}
 		}
 	}
-	if strings.HasPrefix(f.Name, "metadata_") {
+	if IsMetadataColumn(f.Name) {
 		cond := buildCond(f.Name, f.Value, f.Operator, false, "singleColumn")
 		if cond != "" {
 			return []string{cond}, ""
@@ -568,7 +577,6 @@ func BuildWhere(filters []model.Filter, eventsOrder string, eventsAlias, session
 	eventFilters = make([]string, 0)
 	negativeEventFilters = make([]string, 0)
 	sessionFilters = make([]string, 0)
-	sessionFilters = append(sessionFilters, fmt.Sprintf("isNotNull(%s.duration)", sessionsAlias))
 	//sessionColumns := GetSessionColumns(len(isSessionJoin) > 0 && isSessionJoin[0])
 
 	var sessionFiltersList, eventFiltersList, negativeEvents []model.Filter
@@ -581,7 +589,7 @@ func BuildWhere(filters []model.Filter, eventsOrder string, eventsAlias, session
 				filterName = CamelToSnake(f.Name)
 			}
 
-			if _, ok := SessionColumns[filterName]; ok || f.AutoCaptured && strings.HasPrefix(filterName, "metadata_") {
+			if _, ok := SessionColumns[filterName]; ok || f.AutoCaptured && IsMetadataColumn(filterName) {
 				sessionFiltersList = append(sessionFiltersList, f)
 			} else {
 				isEvent = true
@@ -711,6 +719,31 @@ func BuildDurationWhere(filters []model.Filter, tableAlias ...string) ([]string,
 	return conds, rest
 }
 
+// buildLocationConditions extracts the url_path properties of LOCATION filters
+// and turns them into `$current_path` conditions on the given table alias.
+func buildLocationConditions(filters []model.Filter, tableAlias string) []string {
+	var conds []string
+	for _, f := range filters {
+		if f.Name != "LOCATION" {
+			continue
+		}
+		for _, nested := range f.Filters {
+			name := nested.Name
+			if nested.AutoCaptured {
+				name = CamelToSnake(name)
+			}
+			if name != "url_path" || len(nested.Value) == 0 || nested.Value[0] == "" {
+				continue
+			}
+			expr := fmt.Sprintf("%s.\"$current_path\"", tableAlias)
+			if c := buildCond(expr, nested.Value, nested.Operator, false, "singleColumn"); c != "" {
+				conds = append(conds, c)
+			}
+		}
+	}
+	return conds
+}
+
 func FilterOutTypes(filters []model.Filter, typesToRemove []string) (kept []model.Filter, removed []model.Filter) {
 	removeMap := make(map[string]struct{}, len(typesToRemove))
 	for _, t := range typesToRemove {
@@ -726,11 +759,6 @@ func FilterOutTypes(filters []model.Filter, typesToRemove []string) (kept []mode
 	return
 }
 
-func logQuery(query string, args ...interface{}) {
-	if len(args) > 0 {
-		query = fmt.Sprintf(query, args...)
-	}
-}
 func isSlice(v interface{}) bool {
 	return reflect.TypeOf(v).Kind() == reflect.Slice
 }

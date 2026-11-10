@@ -7,10 +7,9 @@ import (
 	"strings"
 
 	"openreplay/backend/pkg/analytics/model"
+	"openreplay/backend/pkg/db/postgres"
 	"openreplay/backend/pkg/db/postgres/pool"
 	"openreplay/backend/pkg/logger"
-
-	"github.com/lib/pq"
 )
 
 type Cards interface {
@@ -218,18 +217,18 @@ func (s *cardsImpl) GetAllPaginated(projectID int, filters CardListFilter, sort 
 	params := []interface{}{projectID}
 	idx := 2
 	if name := filters.GetNameFilter(); name != nil {
-		conds = append(conds, fmt.Sprintf("m.name ILIKE $%d", idx))
-		params = append(params, "%"+*name+"%")
+		conds = append(conds, fmt.Sprintf("m.name ILIKE $%d ESCAPE '\\'", idx))
+		params = append(params, "%"+postgres.EscapeILIKE(*name)+"%")
 		idx++
 	}
 	if t := filters.GetMetricTypeFilter(); t != nil {
 		if *t == "monitors" {
 			conds = append(conds, fmt.Sprintf("m.metric_type = ANY($%d)", idx))
-			params = append(params, pq.Array([]string{"table", "webVital"}))
+			params = append(params, []string{"table", "webVital"})
 			idx++
 
 			conds = append(conds, fmt.Sprintf("m.metric_of = ANY($%d)", idx))
-			params = append(params, pq.Array([]string{"jsException", "errors", "issues"}))
+			params = append(params, []string{"jsException", "errors", "issues"})
 			idx++
 		} else if *t == "web_analytics" {
 			conds = append(conds, fmt.Sprintf("m.metric_type=$%d", idx))
@@ -237,7 +236,7 @@ func (s *cardsImpl) GetAllPaginated(projectID int, filters CardListFilter, sort 
 			idx++
 
 			conds = append(conds, fmt.Sprintf("m.metric_of != ALL($%d)", idx))
-			params = append(params, pq.Array([]string{"webVitalUrl", "jsException", "REQUEST"}))
+			params = append(params, []string{"webVitalUrl", "jsException", "REQUEST"})
 			idx++
 		} else {
 			conds = append(conds, fmt.Sprintf("m.metric_type=$%d", idx))
@@ -249,7 +248,7 @@ func (s *cardsImpl) GetAllPaginated(projectID int, filters CardListFilter, sort 
 	if ids := filters.GetDashboardIDs(); len(ids) > 0 {
 		joinClause += " LEFT JOIN public.dashboard_widgets dw ON m.metric_id=dw.metric_id"
 		conds = append(conds, fmt.Sprintf("dw.dashboard_id=ANY($%d)", idx))
-		params = append(params, pq.Array(ids))
+		params = append(params, ids)
 		idx++
 	}
 	conds = append(conds, "m.deleted_at IS NULL")

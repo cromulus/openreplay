@@ -22,14 +22,12 @@ def app_connection_string(name, port, path):
 HEALTH_ENDPOINTS = {
     "alerts": app_connection_string("alerts-openreplay", 8888, "health"),
     "assets": app_connection_string("assets-openreplay", 8888, "metrics"),
-    "assist": app_connection_string("assist-api-openreplay", 8888, "metrics"),
+    "assist": app_connection_string("api-openreplay", 8888, "metrics"),
     "chalice": app_connection_string("chalice-openreplay", 8888, "metrics"),
     "db": app_connection_string("db-openreplay", 8888, "metrics"),
     "ender": app_connection_string("ender-openreplay", 8888, "metrics"),
-    "heuristics": app_connection_string("heuristics-openreplay", 8888, "metrics"),
     "http": app_connection_string("http-openreplay", 8888, "metrics"),
     "ingress-nginx": app_connection_string("ingress-nginx-openreplay", 80, "healthz"),
-    "integrations": app_connection_string("integrations-openreplay", 8888, "metrics"),
     "sink": app_connection_string("sink-openreplay", 8888, "metrics"),
     "sourcemapreader": app_connection_string(
         "sourcemapreader-openreplay", 8888, "health"
@@ -207,10 +205,8 @@ def get_health(tenant_id=None):
             "db": __check_be_service("db"),
             "ender": __check_be_service("ender"),
             "frontend": __always_healthy,
-            "heuristics": __check_be_service("heuristics"),
             "http": __check_be_service("http"),
             "ingress-nginx": __always_healthy,
-            "integrations": __check_be_service("integrations"),
             "sink": __check_be_service("sink"),
             "sourcemapreader": __check_be_service("sourcemapreader"),
             "storage": __check_be_service("storage"),

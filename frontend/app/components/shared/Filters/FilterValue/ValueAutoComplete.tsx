@@ -1,4 +1,4 @@
-import { TopValue } from '@/mstore/filterStore';
+import { TopValue, getTopValuesKey } from '@/mstore/filterStore';
 import { CloseCircleFilled, RedoOutlined } from '@ant-design/icons';
 import {
   Button,
@@ -116,7 +116,6 @@ const ValueAutoComplete = observer(
     commaQuery = false,
     isDisabled = false,
     isLive = false,
-    scope,
   }: Props) => {
     const predefinedValues = params.isPredefined
       ? (params.possibleValues ?? []).map((v) => ({
@@ -134,14 +133,6 @@ const ValueAutoComplete = observer(
       }
       return map;
     }, [params.isPredefined, params.possibleValues]);
-
-    const getDisplayLabel = (val: string) => {
-      if (params.isPredefined && valueToLabelMap[val]) {
-        return valueToLabelMap[val];
-      }
-      return val;
-    };
-
     const { t } = useTranslation();
     const { filterStore, projectsStore } = useStore();
     const [showValueModal, setShowValueModal] = useState(false);
@@ -153,12 +144,20 @@ const ValueAutoComplete = observer(
     const [selectedValues, setSelectedValues] = useState<string[]>([]);
     const triggerRef = useRef<HTMLButtonElement>(null); // Ref for the main trigger button
 
-    const filterKey = useMemo(() => {
-      if (!projectsStore.siteId || !params.id) return null;
-      return `${projectsStore.siteId}_${params.id}`;
-    }, [projectsStore.siteId, params.id]);
-
-    const topValues: TopValue[] = filterStore.topValues[params.id] || [];
+    const getDisplayLabel = (val: string) => {
+      if (params.isPredefined && valueToLabelMap[val]) {
+        return valueToLabelMap[val];
+      }
+      if (options.length) {
+        const foundOption = options.find((opt) => opt.value === val);
+        if (foundOption) {
+          return foundOption.label || foundOption.name || val;
+        }
+      }
+      return val;
+    };
+    const topValues: TopValue[] =
+      filterStore.topValues[getTopValuesKey(params.id, isLive)] || [];
 
     const mappedTopValues: OptionType[] = useMemo(() => {
       return topValues
@@ -184,18 +183,18 @@ const ValueAutoComplete = observer(
       if (
         showValueModal &&
         !params.isEvent &&
-        filterKey &&
-        !filterStore.topValues[filterKey]
+        projectsStore.siteId &&
+        params.id
       ) {
         setLoadingTopValues(true);
         filterStore
-          .fetchTopValues(params.id, isLive, scope)
+          .fetchTopValues(params.id, isLive)
           .catch((error) => console.error('Failed to load top values', error))
           .finally(() => setLoadingTopValues(false));
       }
     }, [
       showValueModal,
-      filterKey,
+      isLive,
       params.id,
       params.name,
       projectsStore.siteId,
@@ -253,10 +252,6 @@ const ValueAutoComplete = observer(
 
           if (params.eventName) {
             autoCompleteParams.eventName = params.eventName;
-          }
-
-          if (scope) {
-            autoCompleteParams.scope = scope;
           }
 
           const data: { events?: any[] } | any[] =
@@ -409,6 +404,14 @@ const ValueAutoComplete = observer(
           className="mb-2" // Antd margin class
           autoFocus
           allowClear
+          onPressEnter={(e) => {
+            e.stopPropagation();
+            if (query.trim().length > 0) {
+              applyQuery();
+            } else {
+              applySelectedValues();
+            }
+          }}
         />
         <Spin spinning={loadingTopValues && query.length === 0}>
           {filteredOptions.length === 0 ? (

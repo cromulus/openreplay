@@ -7,8 +7,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+
 	"openreplay/backend/pkg/flakeid"
 )
+
+const (
+	// KeySchemeDaily — legacy: key = <escaped-url>.<day-of-month>
+	KeySchemeDaily = "daily"
+	// KeySchemeHash — key = <escaped-url>.<xxhash64(origin body)>
+	KeySchemeHash = "hash"
+)
+
+func ValidKeyScheme(scheme string) bool {
+	return scheme == KeySchemeDaily || scheme == KeySchemeHash
+}
 
 func getSessionKey(sessionID uint64) string {
 	return strconv.FormatUint(
@@ -80,8 +93,31 @@ func GetCachePathForJS(rawurl string) string {
 	return getCachePath(rawurl)
 }
 
-func GetCachePathForAssets(sessionID uint64, rawurl string) string {
+func HashBody(body []byte) string {
+	return strconv.FormatUint(xxhash.Sum64(body), 16)
+}
+
+func GetCachePathWithHash(rawurl string, hash string) string {
+	return getCachePath(rawurl) + "." + hash
+}
+
+func (r *Rewriter) CachePathForAssets(sessionID uint64, rawurl string) string {
+	if r.scheme == KeySchemeHash {
+		return getCachePath(rawurl)
+	}
 	return getCachePathWithKey(sessionID, rawurl)
+}
+
+func (r *Rewriter) rewritePath(sessionID uint64, fullURL string) string {
+	if r.scheme == KeySchemeHash {
+		if r.resolver != nil {
+			if hash, ok := r.resolver.Lookup(fullURL); ok {
+				return GetCachePathWithHash(fullURL, hash)
+			}
+		}
+		return getCachePath(fullURL) // mapping cold: fall back to the current-version pointer
+	}
+	return getCachePathWithKey(sessionID, fullURL)
 }
 
 func (r *Rewriter) RewriteURL(sessionID uint64, baseURL string, relativeURL string) string {
@@ -91,9 +127,30 @@ func (r *Rewriter) RewriteURL(sessionID uint64, baseURL string, relativeURL stri
 	}
 
 	u := url.URL{
-		Path:   r.assetsURL.Path + getCachePathWithKey(sessionID, fullURL),
+		Path:   r.assetsURL.Path + r.rewritePath(sessionID, fullURL),
 		Host:   r.assetsURL.Host,
 		Scheme: r.assetsURL.Scheme,
 	}
 	return u.String()
+}
+
+// MatchesHost reports whether host matches pattern: "example.com" matches the
+// domain and its subdomains, ".example.com" / "*.example.com" only subdomains.
+func MatchesHost(host, pattern string) bool {
+	host, pattern = strings.ToLower(host), strings.ToLower(strings.TrimPrefix(pattern, "*"))
+	if strings.HasPrefix(pattern, ".") {
+		return strings.HasSuffix(host, pattern)
+	}
+	return host == pattern || strings.HasSuffix(host, "."+pattern)
+}
+
+// ParseHostList splits a comma-separated host list, dropping blanks.
+func ParseHostList(s string) []string {
+	var list []string
+	for _, h := range strings.Split(s, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			list = append(list, h)
+		}
+	}
+	return list
 }
