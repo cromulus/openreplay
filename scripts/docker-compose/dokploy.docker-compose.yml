@@ -570,6 +570,28 @@ services:
     restart: unless-stopped
 
 
+  mcp-openreplay:
+    build:
+      context: ../..
+      dockerfile: mcp_app/hosted/Dockerfile
+    container_name: openreplay-mcp
+    environment:
+      OPENREPLAY_URL: "${COMMON_PROTOCOL}://${COMMON_DOMAIN_NAME}"
+    networks:
+      - openreplay-net
+    volumes:
+      - mcpdata:/var/lib/openreplay-mcp
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1536m
+    pids_limit: 256
+    restart: unless-stopped
+
   nginx-openreplay:
     image: nginx:latest
     container_name: nginx
@@ -583,6 +605,7 @@ services:
 
 
 volumes:
+  mcpdata:
   pgdata:
   clickhouse:
   redisdata:

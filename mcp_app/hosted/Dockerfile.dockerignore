@@ -1,0 +1,9 @@
+**
+!mcp_app/**
+!player/**
+**/node_modules
+**/dist
+**/dist-server
+**/.env*
+**/*.mcpb
+**/.DS_Store

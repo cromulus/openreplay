@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 
-const CONFIG_DIR = path.join(os.homedir(), ".openreplay-mcp");
+const CONFIG_DIR = process.env.OPENREPLAY_CONFIG_DIR || path.join(os.homedir(), ".openreplay-mcp");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
 // Project interface

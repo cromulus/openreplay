@@ -520,14 +520,8 @@
     zod-to-json-schema "^3.25.1"
 
 "@openreplay/player@link:../player":
-  version "1.0.0"
-  dependencies:
-    "@medv/finder" "^4.0.2"
-    fflate "^0.8.2"
-    fzstd "^0.1.1"
-    modern-tar "^0.8.4"
-    socket.io-client "^4.8.3"
-    syncod "^0.0.1"
+  version "0.0.0"
+  uid ""
 
 "@rolldown/pluginutils@1.0.0-rc.3":
   version "1.0.0-rc.3"
@@ -1054,7 +1048,7 @@ express-rate-limit@^8.2.1:
   dependencies:
     ip-address "10.1.0"
 
-express@^5.2.1:
+express@5.2.1, express@^5.2.1:
   version "5.2.1"
   resolved "https://registry.yarnpkg.com/express/-/express-5.2.1.tgz#8f21d15b6d327f92b4794ecf8cb08a72f956ac04"
   integrity sha512-hIS4idWWai69NezIdRt2xFVofaF4j+6INOpJlVOLDO8zXGpUVEVzIYk12UUi2JzjEzWL3IOAxcTubgz9Po0yXw==
