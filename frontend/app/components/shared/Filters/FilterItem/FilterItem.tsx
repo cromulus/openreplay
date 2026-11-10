@@ -2,6 +2,7 @@ import { useStore } from '@/mstore';
 import {
   Filter,
   OPERATORS,
+  getLiveOperatorsByType,
   getOperatorsByType,
 } from '@/mstore/types/filterConstants';
 import { IFilter } from '@/mstore/types/filterItem';
@@ -80,9 +81,14 @@ function FilterItem(props: Props) {
     ? filterStore.getScopedCurrentProjectFilters([scope])
     : filterStore.getCurrentProjectFilters();
 
+  const hasSubfilters =
+    filter.isEvent &&
+    !isSubItem &&
+    filter.category !== 'segments' &&
+    filter.category !== 'features';
+
   useMemo(() => {
-    if (isSubItem || filter?.name === 'duration' || !filter.isEvent || !fltId)
-      return;
+    if (filter?.name === 'duration' || !fltId || !hasSubfilters) return;
     filterStore.getEventFilters(fltId).then((filters) => {
       setEventFilterOptions(filters);
     });
@@ -100,9 +106,11 @@ function FilterItem(props: Props) {
   }, [isSubItem, parentEventFilterOptions, eventSelections]);
 
   const isDurationFilter = filter.name === 'duration' && filter.autoCaptured;
-  const operatorOptions = isDurationFilter
-    ? OPERATORS.duration
-    : getOperatorsByType(filter.dataType);
+  const operatorOptions = isLive
+    ? getLiveOperatorsByType(filter.dataType)
+    : isDurationFilter
+      ? OPERATORS.duration
+      : getOperatorsByType(filter.dataType);
 
   const canShowValues = useMemo(
     () =>
@@ -230,11 +238,6 @@ function FilterItem(props: Props) {
     }
   }, [readonly, filter.value]);
 
-  const hasSubfilters =
-    filter.isEvent &&
-    !isSubItem &&
-    filter.category !== 'segments' &&
-    filter.category !== 'features';
   return (
     <div className={cn('w-full', isDragging ? 'opacity-50' : '')}>
       <div className="flex items-start w-full gap-x-2">

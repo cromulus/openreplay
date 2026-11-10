@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -24,7 +26,7 @@ func (a *authImpl) isAuthorizedApiKey(apiKey string, projectKey string) (*tenant
 
 	_, err = a.projects.GetProjectByKeyAndTenant(projectKey, dbTenant.TenantID)
 	if err != nil {
-		a.log.Warn(nil, "Unauthorized request, wrong api key: %s", a)
+		a.log.Warn(context.Background(), "Unauthorized request, wrong api key for project %q", projectKey)
 		return nil, err
 	}
 
@@ -43,12 +45,12 @@ func (a *authImpl) validateProjectAccess(r *http.Request, u *user.User) error {
 		return nil
 	}
 
-	projectID, err := api.GetPathParam(r, "projectId", api.ParseUint32, uint32(0))
-	if err != nil || projectID == 0 {
-		projectID, err = api.GetPathParam(r, "project", api.ParseUint32, uint32(0))
-		if err != nil || projectID == 0 {
-			return nil
-		}
+	projectID, err := api.GetProject(r)
+	if errors.Is(err, api.ErrNoProjectInPath) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
 	project, err := a.projects.GetProjectNotDeleted(projectID)
@@ -58,6 +60,10 @@ func (a *authImpl) validateProjectAccess(r *http.Request, u *user.User) error {
 
 	if project.TenantID != int(u.TenantID) {
 		return fmt.Errorf("project does not belong to user's tenant")
+	}
+
+	if !u.CanAccessProject(projectID) {
+		return fmt.Errorf("project is not allowed for user's role")
 	}
 
 	return nil

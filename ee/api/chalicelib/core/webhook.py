@@ -1,11 +1,10 @@
 import logging
 from typing import Optional
 
-import requests
 from fastapi import HTTPException, status
 
 import schemas
-from chalicelib.utils import pg_client, helper
+from chalicelib.utils import pg_client, helper, ssrf
 from chalicelib.utils.TimeUTC import TimeUTC
 from chalicelib.utils.log import sanitize
 
@@ -170,7 +169,10 @@ def trigger_batch(data_list):
         if webhooks_map[w["destination"]] is None:
             logging.error(f"!!Error webhook not found: webhook_id={w['destination']}")
         else:
-            __trigger(hook=webhooks_map[w["destination"]], data=w["data"])
+            try:
+                __trigger(hook=webhooks_map[w["destination"]], data=w["data"])
+            except Exception:
+                logging.exception(f"!!Error while triggering webhook_id={w['destination']}")
 
 
 def __trigger(hook, data):
@@ -179,7 +181,7 @@ def __trigger(hook, data):
         if hook["authHeader"] is not None and len(hook["authHeader"]) > 0:
             headers = {"Authorization": hook["authHeader"]}
 
-        r = requests.post(url=hook["endpoint"], json=data, headers=headers)
+        r = ssrf.post_json(endpoint=hook["endpoint"], json_data=data, headers=headers)
         if r.status_code != 200:
             logging.error("=======> webhook: something went wrong for:")
             logging.error(hook)

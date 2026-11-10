@@ -1,10 +1,11 @@
-import { Component } from "solid-js";
+import type { Component } from "solid-js";
 import orLogo from "~/assets/orSpot.svg";
 import {
   HomePageSvg,
   SlackSvg,
   SettingsSvg,
 } from "../Icons";
+import { settingsStore } from "~/utils/storage";
 
 interface HeaderProps {
   openSettings: () => void;
@@ -12,7 +13,7 @@ interface HeaderProps {
 
 const Header: Component<HeaderProps> = (props) => {
   const openHomePage = async () => {
-    const { settings } = await chrome.storage.local.get("settings");
+    const settings = await settingsStore.getValue();
     return window.open(`${settings.ingestPoint}/spots`, "_blank");
   };
 

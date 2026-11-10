@@ -1,6 +1,7 @@
 package com.openreplay.reactnative
 
 import android.content.Context
+import com.facebook.react.uimanager.PointerEvents
 import com.facebook.react.uimanager.ThemedReactContext
 import com.facebook.react.uimanager.ViewGroupManager
 import com.facebook.react.views.view.ReactViewGroup
@@ -14,9 +15,20 @@ class RnTrackerSanitizedViewManager : ViewGroupManager<RnTrackerSanitizedView>()
 
 }
 
+/**
+ * Invisible marker that reports the frame of a sanitized region to the
+ * screenshot manager. It is rendered as an absolutely positioned sibling behind
+ * the sanitized subtree (see `ORSanitizedView` in src/index.tsx), so it must
+ * never become a touch target for the content it covers.
+ */
 class RnTrackerSanitizedView(context: Context) : ReactViewGroup(context) {
+  init {
+    pointerEvents = PointerEvents.NONE
+  }
+
   override fun onAttachedToWindow() {
     super.onAttachedToWindow()
+    pointerEvents = PointerEvents.NONE
     ScreenshotManager.addSanitizedElement(this)
   }
 

@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"openreplay/backend/internal/assets/resolver"
 	config "openreplay/backend/internal/config/sink"
 	"openreplay/backend/internal/sink/assetscache"
 	"openreplay/backend/internal/sink/sessionwriter"
@@ -43,7 +44,17 @@ func main() {
 		return producer.Ping(ctx)
 	})
 
-	rewriter, err := assets.NewRewriter(cfg.AssetsOrigin)
+	var rewriterResolver assets.Resolver
+	if cfg.KeyScheme == assets.KeySchemeHash {
+		urlResolver, err := resolver.New(log, cfg.ConnectionURL, nil)
+		if err != nil {
+			log.Fatal(ctx, "can't init assets resolver: %s", err)
+		}
+		defer urlResolver.Close()
+		rewriterResolver = urlResolver
+	}
+
+	rewriter, err := assets.NewRewriterWithScheme(cfg.AssetsOrigin, cfg.KeyScheme, rewriterResolver)
 	if err != nil {
 		log.Fatal(ctx, "can't init rewriter: %s", err)
 	}
@@ -67,7 +78,7 @@ func main() {
 	})
 
 	projManager := projects.New(log, pgConn, redisClient, dbMetric)
-	sessManager := sessions.New(log, pgConn, projManager, redisClient, dbMetric, sessions.DoNotIgnoreInactiveProjects)
+	sessManager := sessions.New(log, pgConn, projManager, redisClient, dbMetric, sessions.IgnoreInactiveProjects)
 
 	filePool := sessionwriter.NewFilePool(log, int(cfg.FsUlimit), cfg.FileBuffer, cfg.MaxFileSize, cfg.SyncWorkers)
 	mobWriter := sessionwriter.NewMobWriter(log, sessManager, filePool, cfg.FsDir, cfg.FileSplitTime)
@@ -93,8 +104,12 @@ func main() {
 		cfg.MessageSizeLimit,
 		func(t types.RebalanceType, partitions []uint64) {
 			stats := mobWriter.Sync()
-			log.Info(ctx, "manual sync finished, fds=%d/%d, synced=%d, size=%.2fMB, dur=%dms",
-				stats.OpenFiles, stats.FilesLimit, stats.FilesSynced,
+			sinkMetrics.RecordOpenFiles(float64(stats.OpenFiles), float64(stats.FilesLimit))
+			sinkMetrics.IncreaseFileEvictions(float64(stats.Evicted))
+			sinkMetrics.RecordSyncDuration(float64(stats.Duration.Milliseconds()))
+			sinkMetrics.IncreaseSyncedBytes(float64(stats.BytesSynced))
+			log.Info(ctx, "manual sync finished, fds=%d/%d, synced=%d, evicted=%d, size=%.2fMB, dur=%dms",
+				stats.OpenFiles, stats.FilesLimit, stats.FilesSynced, stats.Evicted,
 				float64(stats.BytesSynced)/(1024*1024), stats.Duration.Milliseconds())
 		},
 		types.NoReadBackGap,
@@ -126,10 +141,14 @@ func main() {
 			os.Exit(0)
 		case <-tickInfo:
 			stats := mobWriter.Sync()
-			log.Info(ctx, "sync: fds=%d/%d, synced=%d, size=%.2fMB, dur=%dms",
-				stats.OpenFiles, stats.FilesLimit, stats.FilesSynced,
+			sinkMetrics.RecordOpenFiles(float64(stats.OpenFiles), float64(stats.FilesLimit))
+			sinkMetrics.IncreaseFileEvictions(float64(stats.Evicted))
+			sinkMetrics.RecordSyncDuration(float64(stats.Duration.Milliseconds()))
+			sinkMetrics.IncreaseSyncedBytes(float64(stats.BytesSynced))
+			log.Info(ctx, "sync: fds=%d/%d, synced=%d, evicted=%d, size=%.2fMB, dur=%dms",
+				stats.OpenFiles, stats.FilesLimit, stats.FilesSynced, stats.Evicted,
 				float64(stats.BytesSynced)/(1024*1024), stats.Duration.Milliseconds())
-			mobWriter.EvictStale(cfg.SessionTTL)
+			sinkMetrics.IncreaseStaleSessionsEvicted(float64(mobWriter.EvictStale(cfg.SessionTTL)))
 			if err := consumer.Commit(); err != nil {
 				log.Error(ctx, "can't commit messages: %s", err)
 			}

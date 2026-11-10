@@ -136,7 +136,6 @@ func (t *TimeSeriesQueryBuilder) buildTimeSeriesQuery(p *Payload, s model.Series
 		"projectId":      p.ProjectId,
 	}
 
-	logQuery(fmt.Sprintf("TimeSeriesQueryBuilder.buildQuery: %s", query))
 	return query, params, nil
 }
 
@@ -152,7 +151,7 @@ func (t *TimeSeriesQueryBuilder) buildSubQuery(p *Payload, s model.Series, metri
 		if filter.AutoCaptured && !filter.IsEvent {
 			filter.Name = CamelToSnake(filter.Name)
 		}
-		if _, exists := SessionColumns[filter.Name]; exists || strings.HasPrefix(filter.Name, "metadata_") {
+		if _, exists := SessionColumns[filter.Name]; exists || IsMetadataColumn(filter.Name) {
 			sessionFilters = append(sessionFilters, filter)
 		} else {
 			eventFilters = append(eventFilters, filter)
@@ -231,16 +230,8 @@ func (t *TimeSeriesQueryBuilder) buildEventsBasedSubQuery(p *Payload, s model.Se
 	sessionsQuery := BuildSessionsSubQuery(sessionFilters, p.StartTimestamp, p.Breakdowns)
 	projection, joinEvents := t.getProjectionAndJoin(metric, p)
 
-	for _, bdName := range p.Breakdowns {
-		dim, ok := breakdownDimensions[bdName]
-		if !ok {
-			continue
-		}
-		if dim.EventOnly {
-			projection += ", evt." + bdName
-		} else {
-			projection += ", s." + bdName
-		}
+	for _, ref := range GetBreakdownJoinRefs(p.Breakdowns, "evt", "s") {
+		projection += ", " + ref
 	}
 
 	return fmt.Sprintf(

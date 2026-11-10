@@ -3,7 +3,9 @@ const {
     IDENTITIES,
     EVENTS_DEFINITION,
     extractSessionInfo,
-    errorHandler
+    errorHandler,
+    agentCanCall,
+    agentMaySend,
 } = require("./assist");
 const {
     addSession,
@@ -221,6 +223,10 @@ async function onUpdateEvent(socket, ...args) {
 
 async function onWebrtcAgentHandler(socket, ...args) {
     if (socket.handshake.query.identity === IDENTITIES.agent) {
+        if (!agentCanCall(socket)) {
+            logger.debug(`${socket.id} has no call permission, dropping webrtc agent event`);
+            return;
+        }
         const agentIdToConnect = args[0]?.data?.toAgentId;
         logger.debug(`${socket.id} sent webrtc event to agent:${agentIdToConnect}`);
         if (agentIdToConnect && socket.handshake.sessionData.AGENTS_CONNECTED.includes(agentIdToConnect)) {
@@ -236,33 +242,13 @@ async function onAny(socket, eventName, ...args) {
     }
     args[0] = updateSessionData(socket, args[0])
     if (socket.handshake.query.identity === IDENTITIES.session) {
-        const room = socket.handshake.query.roomId;
-        const memberSet = io.of('/').adapter.rooms.get(room);
-        const recipients = [];
-        const agentSockets = [];
-        if (memberSet) {
-            for (const id of memberSet) {
-                if (id === socket.id) continue;
-                const s = io.of('/').sockets.get(id);
-                recipients.push(`${id}(${s ? s.handshake.query.identity : '?'})`);
-                if (s && s.handshake.query.identity === IDENTITIES.agent) {
-                    agentSockets.push(s);
-                }
-            }
-        }
-        const batch = Array.isArray(args[0]?.data) ? args[0].data.length : '?';
-        const messageSize = JSON.stringify(args[0]).length;
-        logger.debug(`ev=${eventName} from=${socket.id}/${socket.handshake.query.identity} room=${room} recipients=[${recipients.join(',')}] batch=${batch} size:${messageSize}`);
-        sendFrom(socket, room, eventName, args[0]);
-        for (const a of agentSockets) {
-            let buffered = '?', writeBuf = '?', writable = '?', transportName = '?';
-            try { buffered = a.conn?.transport?.socket?.getBufferedAmount?.() ?? '?'; } catch (e) {}
-            try { writeBuf = a.conn?.writeBuffer?.length ?? '?'; } catch (e) {}
-            try { writable = a.conn?.transport?.writable ?? '?'; } catch (e) {}
-            try { transportName = a.conn?.transport?.name ?? '?'; } catch (e) {}
-            logger.debug(`[BP] ev=${eventName} agent=${a.id} transport=${transportName} bufferedAmount=${buffered} writeBuf=${writeBuf} writable=${writable}`);
-        }
+        logger.debug(`received event:${eventName}, from:${socket.handshake.query.identity}, sending message to room:${socket.handshake.query.roomId}`);
+        sendFrom(socket, socket.handshake.query.roomId, eventName, args[0]);
     } else {
+        if (!agentMaySend(socket, eventName)) {
+            logger.debug(`${socket.id} has no call permission, dropping event:${eventName}`);
+            return;
+        }
         handleEvent(eventName, socket, args[0]);
         logger.debug(`received event:${eventName}, from:${socket.handshake.query.identity}, sending message to session of room:${socket.handshake.query.roomId}`);
         let socketId = await findSessionSocketId(socket.handshake.query.roomId, args[0]?.meta?.tabId);

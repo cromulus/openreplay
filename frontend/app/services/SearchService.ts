@@ -1,18 +1,6 @@
 import BaseService from 'App/services/BaseService';
 
 export default class SearchService extends BaseService {
-  async fetchSessions(params: any) {
-    const r = await this.client.post('/PROJECT_ID/sessions/search', params);
-    const j = await r.json();
-    return j.data;
-  }
-
-  async fetchSavedSearchList() {
-    const r = await this.client.get('/PROJECT_ID/sessions/search/saved');
-    const j = await r.json();
-    return j.data;
-  }
-
   async deleteSavedSearch(searchId: string) {
     const r = await this.client.delete(
       `/PROJECT_ID/sessions/search/saved/${searchId}`,
@@ -22,7 +10,13 @@ export default class SearchService extends BaseService {
   }
 
   async fetchFilterSearch(params: any) {
-    const r = await this.client.get('/PROJECT_ID/events/search', params);
+    // legacy callers passed the property as `type`/`key`; `scope` is not read
+    const { type, key, scope, ...rest } = params;
+    const r = await this.client.get('/PROJECT_ID/properties/autocomplete', {
+      ...rest,
+      propertyName: key ?? type,
+      live: true,
+    });
     const j = await r.json();
     return j.data;
   }
@@ -42,7 +36,11 @@ export default class SearchService extends BaseService {
     return j.data;
   }
 
-  async fetchSavedSearch(params?: { limit?: number; offset?: number }) {
+  async fetchSavedSearch(params?: {
+    limit?: number;
+    offset?: number;
+    withStats?: 1;
+  }) {
     const r = await this.client.get(
       '/PROJECT_ID/sessions/search/saved',
       params,
@@ -66,14 +64,14 @@ export default class SearchService extends BaseService {
   }
 
   async fetchTopValues(params: Record<string, any>): Promise<any> {
-    const url = `/pa/PROJECT_ID/properties/autocomplete`;
+    const url = `/PROJECT_ID/properties/autocomplete`;
     const r = await this.client.get(url, params);
     const j = await r.json();
     return j.data;
   }
 
   async fetchAutoCompleteValues(params: Record<string, any>): Promise<any> {
-    const url = `/pa/PROJECT_ID/properties/autocomplete`;
+    const url = `/PROJECT_ID/properties/autocomplete`;
     const r = await this.client.get(url, params);
     const j = await r.json();
     return j.data;

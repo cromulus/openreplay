@@ -71,6 +71,90 @@ export function getClassSelector(e: Element): string {
   return '.' + Array.from(e.classList).join('.')
 }
 
+export const cssEscape: (str: string) => string =
+  (typeof CSS !== 'undefined' && CSS.escape) || ((str: string) => str)
+
+/** escape a value that goes inside a quoted css attribute selector */
+export function cssAttrValue(value: string): string {
+  return value.replace(/(["\\])/g, '\\$1')
+}
+
+export function getCustomAttributeSelector(e: Element, customAttributes?: string[]): string {
+  if (!customAttributes || customAttributes.length === 0) return ''
+  for (const attr of customAttributes) {
+    const value = e.getAttribute(attr)
+    if (value !== null) {
+      return `[${attr}="${cssAttrValue(value)}"]`
+    }
+  }
+  return ''
+}
+
+const TEXT_LABEL_ATTRIBUTES = ['aria-label', 'title', 'alt', 'placeholder']
+const VALUE_INPUT_TYPES = ['button', 'submit', 'reset']
+
+function cleanLabel(str: string): string {
+  const label = normSpaces(str)
+  return /[a-z0-9]/i.test(label) ? label.slice(0, 100) : ''
+}
+
+function getOwnTextLabel(
+  e: Element,
+  getInnerText: (el: HTMLElement) => string,
+  isAncestor: boolean,
+): string {
+  const tag = e.tagName.toUpperCase()
+  if (tag !== 'SELECT') {
+    const rawText = getInnerText(e as HTMLElement) || ''
+    // truncated or multiline text belongs to a container, not to this element
+    if (rawText.length <= 100 && !(isAncestor && /[\r\n]/.test(rawText))) {
+      const text = cleanLabel(rawText)
+      if (text) return text
+    }
+  }
+  for (const attr of TEXT_LABEL_ATTRIBUTES) {
+    const value = e.getAttribute(attr)
+    if (value) {
+      const label = cleanLabel(value)
+      if (label) return label
+    }
+  }
+  if (tag === 'INPUT' && VALUE_INPUT_TYPES.includes((e as HTMLInputElement).type)) {
+    const label = cleanLabel((e as HTMLInputElement).value)
+    if (label) return label
+  }
+  // icon-only elements carry their meaning on a child
+  const describedChild = e.querySelector('[aria-label], img[alt], [title]')
+  if (describedChild) {
+    for (const attr of TEXT_LABEL_ATTRIBUTES) {
+      const value = describedChild.getAttribute(attr)
+      if (value) {
+        const label = cleanLabel(value)
+        if (label) return label
+      }
+    }
+  }
+  return ''
+}
+
+/**
+ * human readable label of a clicked element: its own text/description,
+ * then the same for a few ancestors (a click on an icon inside a card)
+ * */
+export function getTextualLabel(
+  e: Element,
+  getInnerText: (el: HTMLElement) => string,
+  maxAncestors = 2,
+): string {
+  let el: Element | null = e
+  for (let depth = 0; el !== null && depth <= maxAncestors; depth++) {
+    const label = getOwnTextLabel(el, getInnerText, depth > 0)
+    if (label) return label
+    el = el.parentElement
+  }
+  return ''
+}
+
 export function getLabelAttribute(e: Element): string | null {
   let value = e.getAttribute('data-openreplay-label')
   if (value !== null) {
@@ -146,10 +230,10 @@ export function generateRandomId(len?: number) {
   const safeCrypto = window.crypto || window.msCrypto
   if (safeCrypto) {
     safeCrypto.getRandomValues(arr)
-    return Array.from(arr, dec2hex).join('')
   } else {
-    return Array.from({ length: len || 40 }, () => dec2hex(Math.floor(Math.random() * 16))).join('')
+    for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256)
   }
+  return Array.from(arr, dec2hex).join('')
 }
 
 export function inIframe() {
@@ -256,8 +340,8 @@ class FIFOTaskScheduler {
   }
 
   // Adds a task to the queue
-  addTask(task: () => any) {
-    this.taskQueue.push(task)
+  addTask(task: () => any, onError?: (e: unknown) => void) {
+    this.taskQueue.push({ task, onError })
     this.runTasks()
   }
 
@@ -269,27 +353,39 @@ class FIFOTaskScheduler {
 
     this.isRunning = true
 
-    const executeNextTask = () => {
+    const executeNextTask = (sync: boolean) => {
       if (this.taskQueue.length === 0) {
         this.isRunning = false
         return
       }
 
-      // Get the next task and execute it
-      const nextTask = this.taskQueue.shift()
-      Promise.resolve(nextTask()).then(() => {
-        requestAnimationFrame(() => executeNextTask())
-      })
+      // Get the next task and execute it. A task that throws (or rejects) must
+      // still schedule the next one: leaving `isRunning` true strands the queue
+      // for the lifetime of the page, and since commits run through here that
+      // silently ends the recording. See #4836.
+      const { task, onError } = this.taskQueue.shift()
+      const scheduleNext = () => requestAnimationFrame(() => executeNextTask(false))
+      let result: any
+      try {
+        result = task()
+      } catch (e) {
+        scheduleNext()
+        // only the synchronous first task still has its caller on the stack
+        if (sync) throw e
+        onError?.(e)
+        return
+      }
+      Promise.resolve(result).then(scheduleNext, scheduleNext)
     }
 
-    executeNextTask()
+    executeNextTask(true)
   }
 }
 
 const scheduler = new FIFOTaskScheduler()
-export function requestIdleCb(callback: () => void) {
+export function requestIdleCb(callback: () => void, onError?: (e: unknown) => void) {
   // performance improvement experiment;
-  scheduler.addTask(callback)
+  scheduler.addTask(callback, onError)
   /**
    * This is a brief polyfill that suits our needs
    * I took inspiration from Microsoft Clarity polyfill on this one
@@ -359,12 +455,17 @@ export function throttleWithTrailing<K, Args extends any[]>(
         timeouts.delete(key);
       }
       lastCalls.set(key, now);
+      // args are consumed now; don't retain them keyed by every id we ever saw
+      lastArgs.delete(key);
       fn(key, ...args);
     } else if (!timeouts.has(key)) {
       const timeoutId = setTimeout(() => {
-        lastCalls.set(key, Date.now());
         timeouts.delete(key);
         const finalArgs = lastArgs.get(key)!;
+        // Trailing call closes the throttle window for this key: drop its
+        // bookkeeping so the maps don't grow one permanent entry per key.
+        lastArgs.delete(key);
+        lastCalls.delete(key);
         fn(key, ...finalArgs);
       }, remaining);
       timeouts.set(key, timeoutId);

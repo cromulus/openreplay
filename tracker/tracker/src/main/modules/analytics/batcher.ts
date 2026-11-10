@@ -1,7 +1,10 @@
-import { categories } from './types'
+import { categories, mutationTypes } from './types'
+
+const appendTypes = [mutationTypes.appendProperty, mutationTypes.appendUniqueProperty]
 
 interface PeopleEvent {
   type: string
+  user_id?: string
   timestamp: number
   payload: Record<string, any>
 }
@@ -51,7 +54,9 @@ class Batcher {
   }
 
   sendImmediately(event: any) {
-    this.sendBatch({ [event.category]: [event.data] })
+    this.sendBatch({ [event.category]: [event.data] }, false, () =>
+      this.requeue({ [event.category]: [event.data] }),
+    )
   }
 
   /**
@@ -86,11 +91,22 @@ class Batcher {
     if (!events || events.length === 0) {
       return []
     }
-    const uniqueEventsByType = new Map<string, PeopleEvent>()
+    // keyed by type + user_id: the backend drops actions without a user_id, and merging
+    // mutations aimed at different users would misattribute them
+    const squashed = [] as PeopleEvent[]
+    const indexByType = new Map<string, number>()
 
-    for (let event of events) {
-      const prev = uniqueEventsByType.get(event.type)
-      if (prev) {
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i]
+      // appends to the same key can't be merged into one object without losing values
+      const eventKey = appendTypes.includes(event.type)
+        ? `${event.type}|${i}`
+        : `${event.type}|${event.user_id ?? ''}`
+      const prevIndex = indexByType.get(eventKey)
+      // merging moves this mutation back to where the earlier one was queued, so skip it
+      // when something queued in between touches the same keys (set, increment, set)
+      if (prevIndex !== undefined && !this.touchedAfter(squashed, prevIndex, event)) {
+        const prev = squashed[prevIndex]
         if (event.type === 'increment_property') {
           const previousValues = Object.entries(prev.payload)
           const currentValues = Object.entries(event.payload)
@@ -101,29 +117,59 @@ class Batcher {
             const currValue = typeof event.payload[key] === 'number' ? event.payload[key] : 0
             mergedPayload[key] = prevValue + currValue
           })
-          uniqueEventsByType.set(event.type, {
+          squashed[prevIndex] = {
             type: event.type,
+            user_id: event.user_id,
             timestamp: event.timestamp,
             payload: mergedPayload,
-          })
+          }
           continue
         }
-        // merge payloads, taking priority to the latest one
-        uniqueEventsByType.set(event.type, {
+        // merge payloads, taking priority to the latest one; set_once is the
+        // exception, the first value for a key is the one the backend would keep
+        const payload =
+          event.type === mutationTypes.setPropertyOnce
+            ? { ...(event.payload ?? {}), ...(prev.payload ?? {}) }
+            : { ...(prev.payload ?? {}), ...(event.payload ?? {}) }
+        squashed[prevIndex] = {
           type: event.type,
+          user_id: event.user_id,
           timestamp: event.timestamp,
-          payload: { ...(prev.payload ?? {}), ...(event.payload ?? {}) },
-        })
+          payload,
+        }
       } else {
-        uniqueEventsByType.set(event.type, event)
+        indexByType.set(eventKey, squashed.length)
+        squashed.push(event)
       }
     }
 
-    return Array.from(uniqueEventsByType.values())
+    return squashed
   }
 
-  private sendBatch(batch: Record<string, any>) {
+  private touchedAfter(events: PeopleEvent[], index: number, event: PeopleEvent) {
+    const keys = Object.keys(event.payload ?? {})
+    for (let i = index + 1; i < events.length; i++) {
+      const other = events[i]
+      if ((other.user_id ?? '') !== (event.user_id ?? '')) {
+        continue
+      }
+      if (
+        !other.payload ||
+        keys.some((key) => Object.prototype.hasOwnProperty.call(other.payload, key))
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private sendBatch(
+    batch: Record<string, any>,
+    keepalive = false,
+    onTerminalFailure?: () => void,
+  ) {
     if (this.stopped) {
+      onTerminalFailure?.()
       return
     }
     const sentBatch = batch
@@ -131,11 +177,14 @@ class Batcher {
     const send = () => {
       const token = this.getToken()
       if (!token) {
+        // No token yet: keep the events so they go out once one is available.
+        onTerminalFailure?.()
         return
       }
       attempts++
       return fetch(`${this.backendUrl}${this.apiEdp}`, {
         method: 'POST',
+        keepalive,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -154,6 +203,7 @@ class Batcher {
                 send()
               })
             }
+            onTerminalFailure?.()
             return
           }
           if (response.status === 403) {
@@ -162,6 +212,7 @@ class Batcher {
                 send()
               })
             }
+            onTerminalFailure?.()
             return
           }
           if (!response.ok) {
@@ -171,6 +222,8 @@ class Batcher {
         .catch(() => {
           if (attempts < this.retryLimit) {
             setTimeout(() => void send(), this.retryTimeout)
+          } else {
+            onTerminalFailure?.()
           }
         })
     }
@@ -180,7 +233,14 @@ class Batcher {
   private paused = false
 
   private onVisibilityChange = () => {
-    this.paused = document.hidden
+    if (document.hidden) {
+      // The tab may be closing; flush now with keepalive so buffered events
+      // survive the transition instead of waiting for the (paused) interval.
+      this.flush(true)
+      this.paused = true
+    } else {
+      this.paused = false
+    }
   }
 
   startAutosend() {
@@ -196,17 +256,40 @@ class Batcher {
     }, this.autosendInterval)
   }
 
-  flush() {
-    const categories = Object.keys(this.batch)
-    const isEmpty = categories.every((category) => this.batch[category].length === 0)
+  flush(keepalive = false) {
+    const cats = Object.keys(this.batch)
+    const isEmpty = cats.every((category) => this.batch[category].length === 0)
     if (isEmpty) {
       return
     }
 
-    this.sendBatch(this.getBatches())
-    categories.forEach((key) => {
+    const batches = this.getBatches()
+    // Snapshot what we're about to send so we can restore it if the request
+    // ultimately fails, instead of dropping events the moment we clear the buffer.
+    const snapshot = {
+      [categories.people]: [...batches.data[categories.people]],
+      [categories.events]: [...batches.data[categories.events]],
+    }
+    cats.forEach((key) => {
       this.batch[key] = []
     })
+    this.sendBatch(batches, keepalive, () => this.requeue(snapshot))
+  }
+
+  private requeue(snapshot: Record<string, any[]>) {
+    if (this.stopped) {
+      return
+    }
+    // Put the failed events back at the front, ahead of anything queued since,
+    // so they're retried on the next flush rather than lost.
+    this.batch[categories.people] = [
+      ...(snapshot[categories.people] ?? []),
+      ...this.batch[categories.people],
+    ]
+    this.batch[categories.events] = [
+      ...(snapshot[categories.events] ?? []),
+      ...this.batch[categories.events],
+    ]
   }
 
   stop() {

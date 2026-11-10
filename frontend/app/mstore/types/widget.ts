@@ -1,9 +1,18 @@
 import Period, { LAST_24_HOURS } from 'Types/app/period';
-import { getChartFormatter } from 'Types/dashboard/helper';
+import {
+  fillTimeseriesGaps,
+  getChartFormatter,
+} from 'Types/dashboard/helper';
 import { FilterKey } from 'Types/filter/filterType';
 import { DateTime } from 'luxon';
 import { makeAutoObservable, observable, runInAction } from 'mobx';
 
+import {
+  type Breakdown,
+  type StoredBreakdown,
+  normalizeBreakdown,
+  toBreakdown,
+} from 'App/components/Dashboard/components/BreakdownFilter/breakdownDimensions';
 import {
   FUNNEL,
   HEATMAP,
@@ -121,7 +130,7 @@ export default class Widget {
   sortBy?: string = '';
   sortOrder?: string = 'desc';
   includeClickRage?: boolean = false;
-  breakdowns: string[] = [];
+  breakdowns: Breakdown[] = [];
 
   period: Record<string, any> = Period({ rangeName: LAST_24_HOURS }); // temp value in detail view
   hasChanged: boolean = false;
@@ -181,13 +190,13 @@ export default class Widget {
   }
 
   addBreakdown(filter: any) {
-    this.breakdowns = [...this.breakdowns, filter.name];
+    this.breakdowns = [...this.breakdowns, toBreakdown(filter)];
     this.hasChanged = true;
   }
 
   updateBreakdown(index: number, filter: any) {
     const next = [...this.breakdowns];
-    next[index] = filter.name;
+    next[index] = toBreakdown(filter);
     this.breakdowns = next;
     this.hasChanged = true;
   }
@@ -253,7 +262,9 @@ export default class Widget {
       this.isPublic = json.isPublic;
       this.sortBy = json.sortBy || '';
       this.sortOrder = json.sortOrder || 'desc';
-      this.breakdowns = json.breakdowns || [];
+      this.breakdowns = ((json.breakdowns || []) as StoredBreakdown[]).map(
+        normalizeBreakdown,
+      );
 
       if (this.metricType === FUNNEL) {
         this.series[0].filter.eventsOrder = 'then';
@@ -273,7 +284,7 @@ export default class Widget {
         this.metricValue =
           json.metricValue && json.metricValue.length > 0
             ? json.metricValue
-            : ['LOCATION'];
+            : ['location'];
         if (json.startPoint) {
           if (Array.isArray(json.startPoint) && json.startPoint.length > 0) {
             const sp = json.startPoint[0];
@@ -360,7 +371,7 @@ export default class Widget {
           this.metricOf === FilterKey.ERRORS ||
           this.metricOf === FilterKey.SESSIONS ||
           this.metricOf === FilterKey.SLOWEST_RESOURCES ||
-          this.metricOf === FilterKey.MISSING_RESOURCES ||
+          this.metricOf === FilterKey.MISSING_RESOURCE ||
           this.metricOf === FilterKey.PAGES_RESPONSE_TIME_DISTRIBUTION ||
           this.metricType === USER_PATH
             ? 4
@@ -721,7 +732,9 @@ export default class Widget {
         const { chart, namesMap, breakdownData } =
           this.transformNewSeriesFormat(data.series, isComparison);
 
-        _data['chart'] = (getChartFormatter(period, density) as any)(chart);
+        _data['chart'] = (getChartFormatter(period, density) as any)(
+          fillTimeseriesGaps(chart, period, density),
+        );
         _data['namesMap'] = namesMap;
         _data['value'] = data.value;
         _data['unit'] = data.unit;

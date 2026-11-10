@@ -5,7 +5,6 @@ import react from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import jsxA11y from 'eslint-plugin-jsx-a11y';
 import prettierConfig from 'eslint-config-prettier';
-import prettierPlugin from 'eslint-plugin-prettier';
 import importPlugin from 'eslint-plugin-import';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -18,6 +17,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export default [
+  // Vendored, minified third-party sources: never our lint surface.
+  { ignores: ['app/assets/prism/**', '**/*.min.js'] },
   js.configs.recommended,
   {
     files: ['**/*.ts', '**/*.tsx', '**/*.js', '**/*.jsx'],
@@ -36,7 +37,7 @@ export default [
         ecmaFeatures: {
           jsx: true,
         },
-        project: './tsconfig.json',
+        project: ['./tsconfig.json', './tests/tsconfig.json'],
       },
       // Add this to define environments
       globals: {
@@ -52,7 +53,6 @@ export default [
       import: importPlugin,
       jest: pluginJest,
       i18next,
-      prettierPlugin,
     },
     settings: {
       'import/resolver': {
@@ -95,7 +95,6 @@ export default [
 
       // i18next rules
       'i18next/no-literal-string': 'warn',
-      'prettierPlugin/prettier': 'warn',
 
       // General rules
       'no-console': 'off', // Change from 'warn' to 'off' if you want to allow console statements
@@ -132,7 +131,6 @@ export default [
       'react/no-find-dom-node': 'off',
       'import/no-named-as-default': 'off',
       'import/no-extraneous-dependencies': 'off',
-      'react-hooks/rules-of-hooks': 'off',
       '@typescript-eslint/no-non-null-asserted-optional-chain': 'off',
       'react/no-children-prop': 'off',
     },
@@ -157,7 +155,7 @@ export default [
       parserOptions: {
         ecmaVersion: 2022,
         sourceType: 'module',
-        project: './tsconfig.json',
+        project: ['./tsconfig.json', './tests/tsconfig.json'],
       },
       globals: {
         ...globals.jest,
@@ -180,6 +178,51 @@ export default [
       'jest/valid-expect': 'error',
       '@typescript-eslint/no-explicit-any': 'off',
       'no-undef': 'off', // Turn off no-undef for test files since Jest globals are handled
+    },
+  },
+  // App code reaches the UI library only through the 'UI' barrel; the library
+  // itself never imports its own barrel, which would be circular.
+  {
+    files: ['app/**/*.{ts,tsx,js,jsx}'],
+    ignores: ['app/components/ui/**'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              // UI/Icons/* is the generated icon set, not barrel API.
+              regex: '^UI/(?!Icons/)',
+              message:
+                "Import from the 'UI' barrel instead, e.g. import { Icon } from 'UI'.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    files: ['app/components/ui/**/*.{ts,tsx,js,jsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: 'UI',
+              message:
+                'Circular: the UI library must not import its own barrel. Use a relative import, e.g. ../Icon.',
+            },
+          ],
+          patterns: [
+            {
+              group: ['UI/*'],
+              message:
+                'Circular: use a relative import instead, e.g. ../Icon.',
+            },
+          ],
+        },
+      ],
     },
   },
   // Apply prettier as last to override other formatting rules

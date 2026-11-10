@@ -1,21 +1,25 @@
 import { Button, Dropdown, MenuProps, Typography } from 'antd';
+import { ChevronDown } from 'lucide-react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown } from 'lucide-react';
 
 const langs = [
   { code: 'en', label: 'English' },
   { code: 'fr', label: 'Français' },
   { code: 'es', label: 'Español' },
   { code: 'ru', label: 'Русский' },
+  { code: 'uk', label: 'Українська' },
   { code: 'zh', label: '简体中文' },
+  { code: 'ko', label: '한국어' },
 ];
 const langLabels = {
   en: 'English',
   fr: 'Français',
   es: 'Español',
   ru: 'Русский',
+  uk: 'Українська',
   zh: '中國人',
+  ko: '한국어',
 };
 
 function LanguageSwitcher() {
@@ -25,9 +29,16 @@ function LanguageSwitcher() {
   const onChange = (val: string) => {
     setSelected(val);
   };
+  const pending = React.useRef<string | null>(null);
   const handleChangeLanguage = () => {
-    void i18n.changeLanguage(selected);
     localStorage.setItem('i18nextLng', selected);
+    // Locale chunks load at different speeds, so a slower earlier request must
+    // not be the one that wins.
+    pending.current = selected;
+    void i18n.changeLanguage(selected).then(() => {
+      if (pending.current !== selected)
+        void i18n.changeLanguage(pending.current!);
+    });
   };
 
   const menuItems: MenuProps['items'] = langs.map((lang) => ({

@@ -3,9 +3,10 @@ import { isElementNode, hasTag } from '../guards.js'
 
 import IFrameObserver from './iframe_observer.js'
 import ShadowRootObserver from './shadow_root_observer.js'
+import { initUntaintedDom } from '../untaintedDom.js'
 import IFrameOffsets, { Offset } from './iframe_offsets.js'
 
-import { CreateDocument } from '../messages.gen.js'
+import { CreateDocument, SetNodeAttribute } from '../messages.gen.js'
 import App from '../index.js'
 import { IN_BROWSER, hasOpenreplayAttribute, canAccessIframe } from '../../utils.js'
 
@@ -205,8 +206,14 @@ export default class TopObserver extends Observer {
     handle()
   }
 
-  private shadowRootObservers: WeakMap<ShadowRoot, ShadowRootObserver> = new WeakMap()
+  private shadowRootObservers: Map<ShadowRoot, ShadowRootObserver> = new Map()
   private handleShadowRoot(shRoot: ShadowRoot) {
+    this.shadowRootObservers.forEach((obs, root) => {
+      if (root === shRoot || !root.host.isConnected) {
+        obs.disconnect()
+        this.shadowRootObservers.delete(root)
+      }
+    })
     const observer = new ShadowRootObserver(this.app, false, {
       disableSprites: this.options.disableSprites,
       ...getInlineOptions(this.options.inlineCss, console.warn),
@@ -217,6 +224,7 @@ export default class TopObserver extends Observer {
 
   observe(): void {
     // Protection from several subsequent calls?
+    initUntaintedDom()
 
     const observer = this
     Element.prototype.attachShadow = function () {
@@ -225,6 +233,7 @@ export default class TopObserver extends Observer {
       observer.handleShadowRoot(shadow)
       return shadow
     }
+    this.resetThrottledSetNodeData()
     this.app.nodes.clear()
     // Can observe documentElement (<html>) here, because it is not supposed to be changing.
     // However, it is possible in some exotic cases and may cause an ignorance of the newly created <html>
@@ -241,9 +250,45 @@ export default class TopObserver extends Observer {
       },
       window.document.documentElement,
     )
+
+    // Send before `orloaded` so it lands in the initial visual batch (see sendColorScheme).
+    this.sendColorScheme()
+
+    // "DOM parsed" signal: observeRoot sent the full initial tree synchronously above.
+    // The worker keys on this attribute (BatchWriter) to finalize the visual batch.
+    this.app.send(SetNodeAttribute(0, 'orloaded', 'true'))
+
+    if (IN_BROWSER && window.matchMedia) {
+      this.colorSchemeMQL = window.matchMedia('(prefers-color-scheme: dark)')
+      this.colorSchemeListener = this.app.safe(() => this.sendColorScheme())
+      this.colorSchemeMQL.addEventListener?.('change', this.colorSchemeListener)
+    }
+  }
+
+  private colorSchemeMQL: MediaQueryList | null = null
+  private colorSchemeListener: ((e: MediaQueryListEvent) => void) | null = null
+
+  /** Send resolved used color-scheme ('dark'|'light'|'normal') for the player to force on replay. */
+  private sendColorScheme(): void {
+    if (!IN_BROWSER) return
+    const root = document.documentElement
+    let declared = getComputedStyle(root).colorScheme
+    if (!declared || declared === 'normal') {
+      const meta = document.querySelector('meta[name="color-scheme" i]')
+      const content = meta && meta.getAttribute('content')
+      if (content) declared = content
+    }
+    let used = 'normal'
+    if (declared && declared !== 'normal') {
+      const prefersDark = !!window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      // resolve declared support against OS preference into the concrete used scheme
+      used = declared.includes('dark') && (prefersDark || !declared.includes('light')) ? 'dark' : 'light'
+    }
+    this.app.send(SetNodeAttribute(0, '__openreplay_color_scheme', used))
   }
 
   crossdomainObserve(rootNodeId: number, frameOder: number, frameLevel: number) {
+    initUntaintedDom()
     const observer = this
     Element.prototype.attachShadow = function () {
       // eslint-disable-next-line
@@ -262,12 +307,18 @@ export default class TopObserver extends Observer {
   }
 
   disconnect() {
+    if (this.colorSchemeMQL && this.colorSchemeListener) {
+      this.colorSchemeMQL.removeEventListener?.('change', this.colorSchemeListener)
+    }
+    this.colorSchemeMQL = null
+    this.colorSchemeListener = null
     this.iframeOffsets.clear()
     Element.prototype.attachShadow = attachShadowNativeFn
     this.iframeObserversArr.forEach((observer) => observer.disconnect())
     this.iframeObserversArr = []
     this.iframeObservers = new WeakMap()
-    this.shadowRootObservers = new WeakMap()
+    this.shadowRootObservers.forEach((observer) => observer.disconnect())
+    this.shadowRootObservers.clear()
     this.docObservers = new WeakMap()
     super.disconnect()
   }

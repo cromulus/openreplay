@@ -1,5 +1,6 @@
 import { createSignal, onCleanup, createEffect } from "solid-js";
 import { STATES, formatMsToTime } from "~/entrypoints/content/utils";
+import { pageMessages } from "~/utils/pageMessages";
 import micOn from "~/assets/mic-on.svg";
 import { createDraggable } from '@neodrag/solid';
 
@@ -39,8 +40,10 @@ function RecordingControls({
   const [time, setTime] = createSignal(0);
   const [timeStr, setTimeStr] = createSignal(formatMsToTime(0));
 
-  const onMsg = (e: any) => {
-    if (e.data.type === "content:trigger-stop") {
+  const onMsg = (e: MessageEvent) => {
+    if (e.source !== window) return;
+    if (!e.data || typeof e.data !== "object") return;
+    if (e.data.type === pageMessages.controls.triggerStop) {
       void onEnd();
     }
   };

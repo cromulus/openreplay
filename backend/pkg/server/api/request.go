@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,14 +17,21 @@ import (
 	"openreplay/backend/pkg/server/user"
 )
 
+var ErrNoProjectInPath = errors.New("no project in request path")
+
 func GetProject(r *http.Request) (uint32, error) {
-	vars := mux.Vars(r)
-	projID := vars["project"]
-	projectID, err := strconv.Atoi(projID)
-	if err != nil {
-		return 0, err
+	raw, ok := mux.Vars(r)["projectId"]
+	if !ok || raw == "" {
+		raw, ok = mux.Vars(r)["project"]
 	}
-	return uint32(projectID), nil
+	if !ok || raw == "" {
+		return 0, ErrNoProjectInPath
+	}
+	projectID, err := ParseUint32(raw)
+	if err != nil || projectID == 0 {
+		return 0, fmt.Errorf("invalid project id: %q", raw)
+	}
+	return projectID, nil
 }
 
 func GetParam(r *http.Request, param string) (string, error) {
@@ -78,6 +86,19 @@ func ReadBody(log logger.Logger, w http.ResponseWriter, r *http.Request, limit i
 	return bodyBytes, nil
 }
 
+var ErrBodyTooLarge = errors.New("decompressed body exceeds size limit")
+
+func ReadLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrBodyTooLarge
+	}
+	return data, nil
+}
+
 func ReadCompressedBody(log logger.Logger, w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
 	body := http.MaxBytesReader(w, r.Body, limit)
 	var (
@@ -91,9 +112,9 @@ func ReadCompressedBody(log logger.Logger, w http.ResponseWriter, r *http.Reques
 		if err != nil {
 			return nil, fmt.Errorf("can't create gzip reader: %s", err)
 		}
-		bodyBytes, err = io.ReadAll(reader)
+		bodyBytes, err = ReadLimited(reader, limit)
 		if err != nil {
-			return nil, fmt.Errorf("can't read gzip body: %s", err)
+			return nil, fmt.Errorf("can't read gzip body: %w", err)
 		}
 		if err := reader.Close(); err != nil {
 			log.Warn(r.Context(), "can't close gzip reader: %s", err)
@@ -150,9 +171,6 @@ func GetPathParam[T any](r *http.Request, key string, parseFunc func(string) (T,
 	}
 	value, err := parseFunc(valueStr)
 	if err != nil {
-		if len(defaultValue) > 0 {
-			return defaultValue[0], nil
-		}
 		return zero, fmt.Errorf("invalid path param %s: %w", key, err)
 	}
 	return value, nil

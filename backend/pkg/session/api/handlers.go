@@ -4,27 +4,34 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	sessionCfg "openreplay/backend/internal/config/api"
-	"openreplay/backend/pkg/assist/proxy"
+	"openreplay/backend/pkg/assist"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/replays/service"
 	"openreplay/backend/pkg/server/api"
+	"openreplay/backend/pkg/server/user"
 	"openreplay/backend/pkg/session"
 )
+
+func hasAssistPermission(u *user.User, perm string) bool {
+	if u.ServiceAccount {
+		perm = "SERVICE_" + perm
+	}
+	return u.HasPermission(perm)
+}
 
 type handlersImpl struct {
 	log           logger.Logger
 	jsonSizeLimit int64
 	responser     api.Responser
 	sessions      session.Service
-	assist        proxy.Assist
+	assist        assist.Assist
 	files         service.Files
 }
 
-func NewHandlers(log logger.Logger, cfg *sessionCfg.Config, responser api.Responser, sessions session.Service, assist proxy.Assist, files service.Files) (api.Handlers, error) {
+func NewHandlers(log logger.Logger, cfg *sessionCfg.Config, responser api.Responser, sessions session.Service, assist assist.Assist, files service.Files) (api.Handlers, error) {
 	return &handlersImpl{
 		log:           log,
 		jsonSizeLimit: cfg.JsonSizeLimit,
@@ -65,19 +72,28 @@ func (e *handlersImpl) getReplay(w http.ResponseWriter, r *http.Request) {
 
 	data, err := e.sessions.GetReplay(projID, sessID, currUser.GetIDAsString())
 	if err != nil {
-		e.log.Warn(r.Context(), "Error getting replay data: %v", err)
-		if strings.Contains(err.Error(), session.NoSession) {
-			data, err := e.assist.GetLiveSessionByID(projID, sessID)
-			if err != nil {
-				e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, err, time.Now(), r.URL.Path, 0)
-				return
-			}
-			response["data"] = data
-		} else {
-			// FYI: this is a direct copy of the chalice’s logic for compatibility support.
-			e.responser.ResponseWithJSON(e.log, r.Context(), w, map[string]interface{}{"errors": []string{"session not found"}}, startTime, r.URL.Path, bodySize)
+		if !errors.Is(err, session.ErrNoSession) {
+			e.log.Error(r.Context(), "Error getting replay data: %v", err)
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, errors.New("failed to load session"), startTime, r.URL.Path, bodySize)
 			return
 		}
+
+		if !hasAssistPermission(currUser, "ASSIST_LIVE") {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusNotFound, errors.New("session not found"), startTime, r.URL.Path, bodySize)
+			return
+		}
+		e.log.Info(r.Context(), "stored session not found, checking assist for live session")
+		liveData, liveErr := e.assist.GetLiveSessionByID(projID, sessID, hasAssistPermission(currUser, "ASSIST_CALL"))
+		if liveErr != nil {
+			if errors.Is(liveErr, assist.ErrNoLiveSession) {
+				e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusNotFound, errors.New("session not found"), startTime, r.URL.Path, bodySize)
+				return
+			}
+			e.log.Error(r.Context(), "Error getting live session: %v", liveErr)
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, errors.New("failed to load session"), startTime, r.URL.Path, bodySize)
+			return
+		}
+		response["data"] = liveData
 	} else {
 		data.Live, err = e.assist.IsLive(projID, sessID)
 		if err != nil {
@@ -112,7 +128,7 @@ func (e *handlersImpl) getLiveSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	bodySize = len(bodyBytes)
 
-	req := &proxy.GetLiveSessionsRequest{}
+	req := &assist.GetLiveSessionsRequest{}
 	if err := json.Unmarshal(bodyBytes, req); err != nil {
 		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, err, startTime, r.URL.Path, bodySize)
 		return
@@ -150,13 +166,23 @@ func (e *handlersImpl) getLiveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := e.assist.GetLiveSessionByID(projID, sessionID)
+	currUser := api.GetUser(r)
+	data, err := e.assist.GetLiveSessionByID(projID, sessionID, hasAssistPermission(currUser, "ASSIST_CALL"))
 	if err != nil {
-		currUser := api.GetUser(r)
+		if !errors.Is(err, assist.ErrNoLiveSession) {
+			e.log.Error(r.Context(), "Error getting live session: %v", err)
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, errors.New("failed to load session"), startTime, r.URL.Path, bodySize)
+			return
+		}
 
 		data, err = e.sessions.GetReplay(projID, sessionID, currUser.GetIDAsString())
 		if err != nil {
-			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, err, startTime, r.URL.Path, bodySize)
+			if errors.Is(err, session.ErrNoSession) {
+				e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusNotFound, errors.New("session not found"), startTime, r.URL.Path, bodySize)
+				return
+			}
+			e.log.Error(r.Context(), "Error getting replay data: %v", err)
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, errors.New("failed to load session"), startTime, r.URL.Path, bodySize)
 			return
 		}
 	}

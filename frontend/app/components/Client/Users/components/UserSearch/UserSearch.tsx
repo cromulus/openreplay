@@ -1,8 +1,9 @@
-import { useObserver } from 'mobx-react-lite';
+import { observer } from 'mobx-react-lite';
 import React, { useEffect, useState } from 'react';
+
 import { useStore } from 'App/mstore';
-import { Icon, Input } from 'UI';
 import { debounce } from 'App/utils';
+import { Icon, Input } from 'UI';
 
 let debounceUpdate: any = () => {};
 function UserSearch(props) {
@@ -21,7 +22,7 @@ function UserSearch(props) {
     debounceUpdate(name, value);
   };
 
-  return useObserver(() => (
+  return (
     <div className="relative" style={{ width: '300px' }}>
       <Icon
         name="search"
@@ -35,9 +36,11 @@ function UserSearch(props) {
         placeholder="Filter by name, role"
         onChange={write}
         icon="search"
+        // UI/Input hardcodes its height, so size="small" would do nothing here
+        height={24}
       />
     </div>
-  ));
+  );
 }
 
-export default UserSearch;
+export default observer(UserSearch);

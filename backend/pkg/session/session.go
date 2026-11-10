@@ -2,10 +2,11 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strconv"
-	"strings"
+	"time"
 
+	"openreplay/backend/pkg/db/postgres"
 	"openreplay/backend/pkg/db/postgres/pool"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/replays/service"
@@ -15,7 +16,7 @@ import (
 type Service interface {
 	GetReplay(projectID uint32, sessionID uint64, userID string) (*SessionReplay, error)
 	IsExists(projectID uint32, sessionID uint64) (bool, error)
-	GetPlatform(projectID uint32, sessionID uint64) (string, error)
+	GetSessionWindow(projectID uint32, sessionID uint64) (startTs int64, duration *int, found bool, err error)
 	GetFileKey(sessID uint64) (*string, error)
 }
 
@@ -55,7 +56,7 @@ type SessionReplay struct {
 	UserCountry        string                 `json:"userCountry"`
 	PagesCount         int                    `json:"pagesCount"`
 	EventsCount        int                    `json:"eventsCount"`
-	IssueTypes         string                 `json:"issueTypes"`
+	IssueTypes         []string               `json:"issueTypes"`
 	UtmSource          *string                `json:"utmSource"`
 	UtmMedium          *string                `json:"utmMedium"`
 	UtmCampaign        *string                `json:"utmCampaign"`
@@ -76,12 +77,14 @@ type SessionReplay struct {
 	FramesURL          []string               `json:"mobileFrames"`
 	Metadata           map[string]interface{} `json:"metadata"`
 	Live               bool                   `json:"live"`
-	FileKey            *string                `json:"fileKey"`
+	FileKey            *string                `json:"fileKey,omitempty"`
 }
 
 const (
 	NoSession string = "no session in db"
 )
+
+var ErrNoSession = errors.New(NoSession)
 
 // FYI: full_data, include_fav_viewed and group_metadata are always True, so I didn't move it to Go
 func (s *serviceImpl) GetReplay(projectID uint32, sessionID uint64, userID string) (*SessionReplay, error) {
@@ -108,7 +111,7 @@ func (s *serviceImpl) GetReplay(projectID uint32, sessionID uint64, userID strin
 	    s.user_state,
 	    s.pages_count,
 	    s.events_count,
-	    s.issue_types,
+	    COALESCE(s.issue_types::text[], '{}') AS issue_types,
 	    s.utm_source,
 	    s.utm_medium,
 	    s.utm_campaign,
@@ -121,14 +124,14 @@ func (s *serviceImpl) GetReplay(projectID uint32, sessionID uint64, userID strin
 			SELECT 1
 			FROM public.user_favorite_sessions fs
 			WHERE fs.session_id = s.session_id
-			  AND fs.user_id = :user_id
+			  AND fs.user_id = $1
 		) AS favorite,
-	
+
 		EXISTS (
 			SELECT 1
 			FROM public.user_viewed_sessions fs
 			WHERE fs.session_id = s.session_id
-			  AND fs.user_id = :user_id
+			  AND fs.user_id = $1
 		) AS viewed,
 
 		COALESCE(
@@ -154,23 +157,21 @@ func (s *serviceImpl) GetReplay(projectID uint32, sessionID uint64, userID strin
 	
 	FROM public.sessions s
          JOIN public.projects p USING (project_id)
-	WHERE s.project_id = :project_id AND s.session_id = :session_id;
+	WHERE s.project_id = $2 AND s.session_id = $3;
 	`
-
-	// Replace all placeholders with actual values
-	sqlRequest = strings.ReplaceAll(sqlRequest, ":user_id", userID)
-	sqlRequest = strings.ReplaceAll(sqlRequest, ":project_id", strconv.Itoa(int(projectID)))
-	sqlRequest = strings.ReplaceAll(sqlRequest, ":session_id", strconv.Itoa(int(sessionID)))
 
 	// Scan everything into a struct
 	si := &SessionReplay{}
-	if err := s.conn.QueryRow(sqlRequest).Scan(
+	if err := s.conn.QueryRow(sqlRequest, userID, projectID, sessionID).Scan(
 		&si.SessionID, &si.ProjectID, &si.TrackerVersion, &si.StartTs, &si.Duration, &si.Platform, &si.UserID, &si.UserUUID,
 		&si.UserOS, &si.UserOSVersion, &si.UserBrowser, &si.UserBrowserVersion, &si.UserDevice, &si.UserDeviceType,
 		&si.UserDeviceMemory, &si.UserDeviceHeap, &si.UserCountry, &si.UserCity, &si.UserState, &si.PagesCount,
 		&si.EventsCount, &si.IssueTypes, &si.UtmSource, &si.UtmMedium, &si.UtmCampaign, &si.Referrer,
 		&si.BaseReferrer, &si.Timezone, &si.ScreenWidth, &si.ScreenHeight, &si.Favorite, &si.Viewed, &si.Metadata); err != nil {
-		return nil, fmt.Errorf(NoSession+", %s", err)
+		if postgres.IsNoRowsErr(err) {
+			return nil, ErrNoSession
+		}
+		return nil, fmt.Errorf("get session: %w", err)
 	}
 
 	// Get all pre-signed urls
@@ -192,9 +193,15 @@ func (s *serviceImpl) GetReplay(projectID uint32, sessionID uint64, userID strin
 		}
 	}
 
-	if err := s.views.AddSessionView(projectID, sessionID, userID); err != nil {
-		s.log.Error(context.Background(), "failed to add session view", err)
-	}
+	go func() {
+		viewCtx := context.WithValue(context.Background(), "sessionID", fmt.Sprintf("%d", sessionID))
+		viewCtx = context.WithValue(viewCtx, "projectID", fmt.Sprintf("%d", projectID))
+		ctx, cancel := context.WithTimeout(viewCtx, 5*time.Second)
+		defer cancel()
+		if err := s.views.AddSessionView(ctx, projectID, sessionID, userID); err != nil {
+			s.log.Error(ctx, "failed to add session view: %s", err)
+		}
+	}()
 
 	return si, nil
 }
@@ -212,11 +219,16 @@ func (s *serviceImpl) IsExists(projectID uint32, sessionID uint64) (bool, error)
 	return exists, nil
 }
 
-func (s *serviceImpl) GetPlatform(projectID uint32, sessionID uint64) (string, error) {
-	query := `SELECT platform FROM public.projects WHERE project_id = $1`
-	var platform string
-	if err := s.conn.QueryRow(query, projectID).Scan(&platform); err != nil {
-		return "", err
+func (s *serviceImpl) GetSessionWindow(projectID uint32, sessionID uint64) (int64, *int, bool, error) {
+	sql := `SELECT start_ts, duration FROM public.sessions
+            WHERE session_id = $1 AND project_id = $2;`
+	var startTs int64
+	var duration *int
+	if err := s.conn.QueryRow(sql, sessionID, projectID).Scan(&startTs, &duration); err != nil {
+		if postgres.IsNoRowsErr(err) {
+			return 0, nil, false, nil
+		}
+		return 0, nil, false, fmt.Errorf("failed to get session window: %s", err)
 	}
-	return platform, nil
+	return startTs, duration, true, nil
 }

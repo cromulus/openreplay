@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { configurePlayer } from 'Player/config';
 import {
   App,
   ConfigProvider,
@@ -11,27 +12,34 @@ import { DndProvider } from 'react-dnd';
 import { HTML5Backend } from 'react-dnd-html5-backend';
 import { createRoot } from 'react-dom/client';
 
+import logger from 'App/logger';
 import { BrowserRouter, LocationSync } from 'App/routing';
 import { MountPoint, Notification } from 'UI';
 
 import ENV from '../env';
+import { queryClient } from './queryClient';
 import Router from './Router';
 import { ThemeProvider, useTheme } from './ThemeContext';
 import AnimatedSVG from './components/shared/AnimatedSVG';
 import { ICONS } from './components/shared/AnimatedSVG/AnimatedSVG';
-import './i18n';
+import { i18nReady } from './i18n';
 import './init';
-import { RootStore, StoreProvider } from './mstore';
+import { RootStore, StoreProvider, client, userStore } from './mstore';
 import './styles/global.css';
 import './styles/index.css';
+
+configurePlayer({
+  logger,
+  efsClient: client,
+  getUserName: () => userStore.account?.name ?? 'Agent',
+  getApiEndpoint: () => (ENV as any).API_EDP || window.location.origin,
+});
 
 (window as any).env = (window as any).env ?? {};
 (window as any).env.PRODUCTION = ENV.NODE_ENV === 'production';
 // @ts-ignore
 window.getCommitHash = () =>
   console.log(`Version: ${ENV.VERSION}, Commit: ${ENV.COMMIT_HASH}`);
-
-const queryClient = new QueryClient();
 
 const cssVar = (name: string) => `var(--color-${name})`;
 
@@ -48,7 +56,7 @@ const ThemedApp: React.FC = () => {
         siderBg: cssVar('gray-lightest'),
       },
       Segmented: {
-        itemSelectedBg: theme === 'dark' ? cssVar('gray-darkest') : '#FFFFFF',
+        itemSelectedBg: cssVar('control-selected-bg'),
         itemSelectedColor: cssVar('main'),
       },
       Form: {
@@ -226,11 +234,20 @@ document.addEventListener('DOMContentLoaded', () => {
   // @ts-ignore
   const root = createRoot(container);
 
-  root.render(
-    <QueryClientProvider client={queryClient}>
-      <ThemeProvider>
-        <ThemedApp />
-      </ThemeProvider>
-    </QueryClientProvider>,
-  );
+  const render = () =>
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <ThemedApp />
+        </ThemeProvider>
+      </QueryClientProvider>,
+    );
+
+  // Settles on a microtask for `en`; any other language fetches its file first,
+  // which avoids a flash of raw i18n keys. The timeout is the floor: a locale
+  // chunk that never resolves must not hold the app on the loading shell.
+  void Promise.race([
+    i18nReady,
+    new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+  ]).then(render, render);
 });

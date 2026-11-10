@@ -13,14 +13,13 @@ import (
 	"time"
 
 	config "openreplay/backend/internal/config/canvases"
+	"openreplay/backend/pkg/frames"
 	"openreplay/backend/pkg/logger"
 	"openreplay/backend/pkg/messages"
 	"openreplay/backend/pkg/metrics/canvas"
 	"openreplay/backend/pkg/objectstorage"
 	"openreplay/backend/pkg/pool"
 	"openreplay/backend/pkg/queue/types"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 type ImageStorage struct {
@@ -94,12 +93,9 @@ func (v *ImageStorage) CleanSession(ctx context.Context, sessionID uint64) error
 }
 
 func (v *ImageStorage) SaveCanvasToDisk(ctx context.Context, sessID uint64, data []byte) error {
-	type canvasData struct {
-		Name string
-		Data []byte
-	}
-	var msg = &canvasData{}
+	var msg = &frames.Message{}
 	if err := json.Unmarshal(data, msg); err != nil {
+		v.metrics.IncreaseFrames(canvas.FrameBadMessage)
 		return fmt.Errorf("can't parse canvas message, err: %s", err)
 	}
 	v.saverPool.Submit(&saveTask{ctx: ctx, sessionID: sessID, name: msg.Name, image: bytes.NewBuffer(msg.Data)})
@@ -127,6 +123,11 @@ func (v *ImageStorage) writeToDisk(payload interface{}) {
 		task.name = task.name + ".frames"
 	}
 	path := filepath.Join(dir, task.name)
+	if filepath.Dir(path) != dir {
+		v.metrics.IncreaseFrames(canvas.FrameBadMessage)
+		v.log.Error(task.ctx, "frames file name escapes session dir, name: %q", task.name)
+		return
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		v.log.Fatal(task.ctx, "can't open frames file, err: %s", err)
@@ -142,7 +143,7 @@ func (v *ImageStorage) writeToDisk(payload interface{}) {
 	}
 
 	v.metrics.RecordCanvasImageSize(float64(task.image.Len()))
-	v.metrics.IncreaseTotalSavedImages()
+	v.metrics.IncreaseFrames(canvas.FrameSaved)
 
 	v.log.Debug(task.ctx, "canvas image saved, name: %s, size: %3.3f mb", task.name, float64(task.image.Len())/1024.0/1024.0)
 	return
@@ -172,6 +173,7 @@ func (v *ImageStorage) PrepareSessionCanvases(ctx context.Context, sessID uint64
 			Payload: dir,
 		}
 		if err := v.producer.Produce(v.cfg.TopicCanvasTrigger, sessID, msg.Encode()); err != nil {
+			v.metrics.IncreaseTriggerErrors()
 			v.log.Error(ctx, "can't send canvas trigger: %s", err)
 		}
 	}
@@ -195,54 +197,15 @@ func (v *ImageStorage) packCanvas(payload interface{}) {
 
 	path := filepath.Join(task.path, task.name)
 	key := fmt.Sprintf("%d/%s.zst", task.sessionID, task.name)
-	if err := v.streamZstdToS3(key, path); err != nil {
+	if err := frames.StreamZstdToS3(v.objStorage, key, path); err != nil {
 		if !strings.Contains(err.Error(), "no such file or directory") {
 			v.log.Fatal(task.ctx, "can't upload canvas, name: %s, err: %s", task.name, err)
 		}
+		v.metrics.IncreaseUploads(canvas.UploadMissing)
 		return
 	}
-	v.metrics.IncreaseTotalCreatedArchives()
+	v.metrics.IncreaseUploads(canvas.UploadOK)
 	v.metrics.RecordUploadingDuration(time.Since(start).Seconds())
 
 	v.log.Debug(task.ctx, "canvas packed and uploaded successfully in %.3fs, session: %d", time.Since(start).Seconds(), task.sessionID)
-}
-
-func (v *ImageStorage) streamZstdToS3(key, srcPath string) error {
-	pr, pw := io.Pipe()
-	errCh := make(chan error, 1)
-
-	go func() {
-		var wErr error
-		defer func() {
-			if wErr != nil {
-				pw.CloseWithError(wErr)
-			} else {
-				pw.Close()
-			}
-			errCh <- wErr
-		}()
-
-		f, err := os.Open(srcPath)
-		if err != nil {
-			wErr = err
-			return
-		}
-		defer f.Close()
-
-		zw, err := zstd.NewWriter(pw, zstd.WithEncoderLevel(zstd.SpeedFastest))
-		if err != nil {
-			wErr = err
-			return
-		}
-		defer zw.Close()
-
-		_, wErr = io.CopyBuffer(zw, f, make([]byte, 256*1024))
-	}()
-
-	if err := v.objStorage.Upload(pr, key, "application/octet-stream", objectstorage.NoContentEncoding, objectstorage.Zstd); err != nil {
-		pr.CloseWithError(err)
-		<-errCh
-		return err
-	}
-	return <-errCh
 }

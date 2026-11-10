@@ -13,26 +13,38 @@ class RnTrackerViewManager: RCTViewManager {
   }
 }
 
+/// Invisible marker that reports the frame of a tracked region to the analytics
+/// listener. It is rendered as an absolutely positioned sibling behind the
+/// tracked subtree (see `ORTrackedView` in src/index.tsx), so it must never
+/// swallow touches meant for the content it covers. `RCTComponentData`
+/// force-sets `userInteractionEnabled = YES` on every paper view it creates, so
+/// opting out of hit testing is the only way to stay transparent to touches.
 class RntrackerView : UIView {
-    var _orViewName: String = ""
-    var _orScreenName: String = ""
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        return nil
+    }
 
     @objc var viewName: String = "" {
-        didSet {
-            self._orViewName = viewName
-        }
+        didSet { register() }
     }
     @objc var screenName: String = "" {
-        didSet {
-            self._orScreenName = screenName
+        didSet { register() }
+    }
+
+    /// `Analytics` holds observed views in a weak set, so `addObservedView` is
+    /// idempotent and a deallocated view leaves the set on its own. Props can
+    /// land either side of the view entering the window, so registration is
+    /// (re)done on every change — each call also refreshes the screen/view name.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+
+        if window != nil {
+            register()
         }
     }
 
-    override func didMoveToSuperview() {
-        super.didMoveToSuperview()
-
-        if superview != nil {
-            Analytics.shared.addObservedView(view: self, screenName: self._orScreenName, viewName: self._orViewName)
-        }
+    private func register() {
+        guard window != nil, !screenName.isEmpty || !viewName.isEmpty else { return }
+        Analytics.shared.addObservedView(view: self, screenName: screenName, viewName: viewName)
     }
 }

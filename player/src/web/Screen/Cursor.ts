@@ -76,11 +76,14 @@ export default class Cursor {
     }, 500);
   }
 
-  click() {
+  click(showTimerRing = true) {
     if (this.highlightCursor) {
+      this.onClick?.();
+      // In highlight mode the clicked element gets red brackets; the cursor ring
+      // is only a fallback for when no element could be resolved.
+      if (!showTimerRing) return;
       const styleList = styles.timerClicked;
       this.cursor.classList.add(styleList);
-      this.onClick?.();
       setTimeout(() => {
         this.cursor.classList.remove(styleList);
       }, 510);
@@ -113,5 +116,15 @@ export default class Cursor {
 
   setOnClickHook(callback: () => void) {
     this.onClick = callback;
+  }
+
+  /** timer/screenshot mode (URL `timer=true`) — click gets a static red marker */
+  get highlightMode(): boolean {
+    return this.highlightCursor;
+  }
+
+  /** current cursor coords (viewport space) — matches the last mouse move */
+  get position(): Point {
+    return this.coords;
   }
 }

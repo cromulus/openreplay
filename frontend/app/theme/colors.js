@@ -57,6 +57,12 @@ module.exports = {
   'disabled-text': 'rgba(0,0,0, 0.38)',
   'indigo-lightest': 'rgb(238, 242, 255)',
   indigo: 'rgb(97, 95, 255)',
+  'warning-surface': '#fff7ed',
+  'warning-text': '#C26822',
+  // surfaces with no palette equivalent to borrow: the Segmented selected pill
+  // and the nav "New" tag (antd derives both from a hex, so dark can't follow)
+  'control-selected-bg': '#FFFFFF',
+  'tag-brand-bg': '#EBEDFE',
 
   /** DEPRECATED */
   figmaColors: {
@@ -77,6 +83,7 @@ module.exports = {
     white: 'rgb(23, 23, 23)',
     black: '#fff',
     teal: 'rgb(81, 162, 255)',
+    'teal-dark': 'rgb(130, 190, 255)',
     main: 'rgb(81, 162, 255)',
     'text-primary': 'rgb(245, 245, 245)',
     'text-disabled': 'rgba(255, 255, 255, 0.38)',
@@ -87,8 +94,8 @@ module.exports = {
     amber: 'rgb(123, 51, 6)',
     'amber-medium': 'rgb(187, 77, 0)',
     'red-lightest': 'rgb(70, 8, 9)',
-    'indigo-lightest': 'rgb(49, 44, 133)',
-    indigo: 'rgb(97, 95, 255)',
+    'indigo-lightest': 'rgb(39, 53, 80)',
+    indigo: 'rgb(147, 145, 255)',
     'red-light': 'rgb(130, 24, 26)',
 
     'gray-light-shade': 'rgb(64, 64, 64)',
@@ -102,13 +109,13 @@ module.exports = {
     'gray-light-blue': 'rgb(98, 116, 142)',
     'gray-border': '#888',
 
-    'active-blue': 'rgb(93, 14, 192)',
-    'active-dark-blue': 'rgb(93, 14, 192)',
-    'bg-blue': 'rgb(49, 44, 133)',
-    'active-blue-border': 'rgb(67, 45, 215)',
+    'active-blue': 'rgb(34, 47, 68)',
+    'active-dark-blue': 'rgb(44, 60, 87)',
+    'bg-blue': 'rgb(50, 67, 98)',
+    'active-blue-border': 'rgb(51, 69, 97)',
     tealx: 'rgb(0, 213, 190)',
-    'tealx-light': 'rgb(11, 79, 74)',
-    'tealx-light-border': 'rgb(0, 95, 90)',
+    'tealx-light': 'rgb(27, 51, 48)',
+    'tealx-light-border': 'rgb(42, 74, 70)',
 
     'light-blue-bg': 'rgb(16, 78, 100)',
     'disabled-text': 'rgba(255, 255, 255, 0.38)',
@@ -120,6 +127,11 @@ module.exports = {
     offWhite: 'rgba(30, 30, 50, 1)',
     'green-light': 'rgb(3, 46, 21)',
     yellow: 'rgb(67, 32, 4)',
+
+    'warning-surface': 'rgb(67, 38, 12)',
+    'warning-text': 'rgb(251, 191, 128)',
+    'control-selected-bg': 'rgb(51, 51, 51)',
+    'tag-brand-bg': 'rgb(40, 42, 60)',
 
     figmaColors: {
       'accent-secondary': 'rgba(82, 190, 195, 1)',

@@ -1,5 +1,11 @@
 import logger from '../../../logger';
 
+import {
+  isDialogElement,
+  isSelectElement,
+  isValueElement,
+} from '../../../guards';
+
 import ListWalker from '../../../common/ListWalker';
 import type Screen from '../../Screen/Screen';
 import type {
@@ -20,10 +26,12 @@ import {
   VHTMLElement,
   VShadowRoot,
   VSlot,
+  VSpriteMap,
   VText,
 } from './VirtualDOM';
 import { deleteRule, insertRule } from './safeCSSRules';
 import {
+  REPLAY_CSP,
   REPLAY_IFRAME_SANDBOX,
   isForbiddenTag,
   sanitizeAttribute,
@@ -50,6 +58,8 @@ function setupWindowLogging(
 }
 
 const IGNORED_ATTRS = ['autocomplete'];
+/** Keeps the sprite map last among <body>'s children, whatever indices the message stream uses. */
+const SPRITE_MAP_INDEX = Number.MAX_SAFE_INTEGER - 100;
 const ATTR_NAME_REGEXP = /([^\t\n\f \/>"'=]+)/;
 
 export default class DOMManager extends ListWalker<Message> {
@@ -57,10 +67,17 @@ export default class DOMManager extends ListWalker<Message> {
   private readonly vElements: Map<number, VElement> = new Map();
   private readonly olVRoots: Map<number, OnloadVRoot> = new Map();
   private readonly pendingSelectValues: Map<number, string> = new Map();
+  /** nodeId -> desired <dialog> top-layer mode; re-asserted every flush (see reconcileDialogModes). */
+  private readonly dialogModes: Map<number, string> = new Map();
+  private dialogFlushScheduled = false;
   private flushScheduled = false;
   /** required to keep track of iframes, frameId : vnodeId */
   private readonly iframeRoots: Record<number, number> = {};
   private shadowRootParentMap: Map<number, number> = new Map();
+  /** One per <body> of this page (the top document and any reconstructed iframe). */
+  private spriteMaps: VSpriteMap[] = [];
+  private readonly spriteHosts: WeakSet<VElement> = new WeakSet();
+  private spriteContent = '';
   /** Constructed StyleSheets https://developer.mozilla.org/en-US/docs/Web/API/Document/adoptedStyleSheets
    * as well as <style> tag owned StyleSheets
    */
@@ -84,6 +101,9 @@ export default class DOMManager extends ListWalker<Message> {
   private virtualMode = false;
   private hasSlots = false;
   private showVModeBadge?: () => void;
+  /** Scrolls that clamped because the node's content or styles weren't laid out yet. */
+  private clampedScrolls = new Map<Element, { x: number; y: number; tries: number }>();
+  private scrollRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(params: {
     screen: Screen;
@@ -194,6 +214,9 @@ export default class DOMManager extends ListWalker<Message> {
       logger.error('Insert error. Node not found', id);
       return;
     }
+    if (child instanceof VElement && child.tagName === 'BODY') {
+      this.attachSpriteMap(child);
+    }
 
     const parent = this.vElements.get(parentID) || this.olVRoots.get(parentID);
     if (!parent) {
@@ -228,11 +251,63 @@ export default class DOMManager extends ListWalker<Message> {
     parent.insertChildAt(child, index);
   }
 
+  private attachSpriteMap(body: VElement): void {
+    if (this.spriteHosts.has(body)) {
+      return;
+    }
+    this.spriteHosts.add(body);
+    const spriteMap = new VSpriteMap(
+      'svg',
+      true,
+      SPRITE_MAP_INDEX,
+      SPRITE_MAP_INDEX,
+    );
+    // Set on the node, not through setAttribute: the queue is flushed by
+    // VElement.applyChanges, which VSpriteMap deliberately does not call.
+    spriteMap.node.setAttribute('id', 'OPENREPLAY_SPRITES_MAP');
+    spriteMap.node.setAttribute('style', 'display: none;');
+    body.insertChildAt(spriteMap, SPRITE_MAP_INDEX);
+    this.spriteMaps.push(spriteMap);
+    this.writeSprites(spriteMap);
+  }
+
+  private writeSprites(spriteMap: VSpriteMap): void {
+    if (!this.spriteContent) {
+      return;
+    }
+    spriteMap.setContent(this.spriteContent);
+    // The symbols have to be in place before the frame that references them is
+    // painted, so don't wait for the next flush.
+    spriteMap.applyChanges();
+  }
+
+  /** Symbol markup reconstructed by MessageManager; re-applied whenever a <body> appears. */
+  public setSpriteContent(content: string): void {
+    if (content === this.spriteContent) {
+      return;
+    }
+    this.spriteContent = content;
+    this.spriteMaps.forEach((spriteMap) => this.writeSprites(spriteMap));
+  }
+
   private setNodeAttribute(msg: { id: number; name: string; value: string }) {
     let { name, value } = msg;
     const vn = this.vElements.get(msg.id);
     if (!vn) {
       logger.error('SetNodeAttribute: Node not found', msg);
+      return;
+    }
+
+    // Synthetic <dialog> top-layer state, not a real attribute (see reconcileDialogModes).
+    if (name === '__openreplay_dialog') {
+      this.dialogModes.set(msg.id, value);
+      return;
+    }
+
+    // Synthetic marker: force recorded color-scheme on the root (inherits) so UA-painted
+    // surfaces (e.g. <dialog> Canvas bg) don't follow the replayer's OS theme.
+    if (name === '__openreplay_color_scheme') {
+      (vn.node as HTMLElement).style.colorScheme = value;
       return;
     }
 
@@ -302,7 +377,11 @@ export default class DOMManager extends ListWalker<Message> {
           return;
         }
         doc.open();
-        doc.write('<!DOCTYPE html><html></html>');
+        // we write it here since otherwise it will be destroyyed on VDOM update
+        doc.write(
+          '<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" ' +
+            `content="${REPLAY_CSP}"></head></html>`,
+        );
         doc.close();
         const fRoot = doc.documentElement;
         fRoot.innerText = '';
@@ -310,16 +389,28 @@ export default class DOMManager extends ListWalker<Message> {
         const vHTMLElement = new VHTMLElement(fRoot);
         this.vElements.clear();
         this.vElements.set(0, vHTMLElement);
+        // Sessions recorded before the tracker noticed a replaced documentElement
+        // carry a synthesized CreateDocument (see TabManager.recoverSwappedRoot):
+        // the rest of the page references the new <html> by its tracker id, so
+        // alias it onto the document element we just built.
+        const rootId = (msg as { rootId?: number }).rootId;
+        if (rootId !== undefined) {
+          this.vElements.set(rootId, vHTMLElement);
+        }
         const vDoc = OnloadVRoot.fromDocumentNode(doc);
         vDoc.insertChildAt(vHTMLElement, 0);
         this.olVRoots.clear();
+        this.clampedScrolls.clear();
         this.olVRoots.set(0, vDoc); // watchout: id==0 for both Document and documentElement
         // this is done for the AdoptedCSS logic
         // Maybetodo: start Document as 0-node in tracker
         this.vTexts.clear();
+        this.spriteMaps.length = 0;
         this.olStyleSheets.clear();
         this.pendingStyleRules.clear();
         this.pendingSelectValues.clear();
+        this.dialogModes.clear();
+        this.dialogFlushScheduled = false;
         this.flushScheduled = false;
         this.stylesManager.reset();
         return;
@@ -379,11 +470,13 @@ export default class DOMManager extends ListWalker<Message> {
           logger.error('RemoveNode: Node not found', msg);
           return;
         }
-        if (!vChild.parentNode) {
+        if (!vChild.parentNode && !vChild.pendingRoot) {
           logger.error('RemoveNode: Parent node not found', msg);
           return;
         }
-        vChild.parentNode.removeChild(vChild);
+        // cancels an insert deferred until its shadow root / iframe document is ready
+        vChild.pendingRoot = null;
+        vChild.parentNode?.removeChild(vChild);
         this.vElements.delete(msg.id);
         this.vTexts.delete(msg.id);
         return;
@@ -458,13 +551,7 @@ export default class DOMManager extends ListWalker<Message> {
           return;
         }
         const nodeWithValue = vElem.node;
-        if (
-          !(
-            nodeWithValue instanceof HTMLInputElement ||
-            nodeWithValue instanceof HTMLTextAreaElement ||
-            nodeWithValue instanceof HTMLSelectElement
-          )
-        ) {
+        if (!isValueElement(nodeWithValue)) {
           logger.error('Trying to set value of non-Input element', msg);
           return;
         }
@@ -477,7 +564,7 @@ export default class DOMManager extends ListWalker<Message> {
           };
           return;
         }
-        if (nodeWithValue instanceof HTMLSelectElement) {
+        if (isSelectElement(nodeWithValue)) {
           this.pendingSelectValues.set(msg.id, val);
         } else {
           nodeWithValue.value = val; // Maybe make special VInputValueElement type for lazy value update
@@ -599,8 +686,10 @@ export default class DOMManager extends ListWalker<Message> {
           pending.push(msg);
           return;
         }
-        // @ts-ignore (configure ts with recent WebAPI)
-        styleSheet.replaceSync(sanitizeCssText(msg.text));
+        styleSheet.whenReady((s) =>
+          // @ts-ignore (configure ts with recent WebAPI)
+          s.replaceSync(sanitizeCssText(msg.text)),
+        );
         return;
       }
       case MType.AdoptedSsAddOwner: {
@@ -626,6 +715,8 @@ export default class DOMManager extends ListWalker<Message> {
         if (!olStyleSheet) {
           olStyleSheet = OnloadStyleSheet.fromVRootContext(vRoot);
           this.olStyleSheets.set(msg.sheetID, olStyleSheet);
+        } else {
+          olStyleSheet.addOwnerContext(vRoot);
         }
         this.flushPendingStyleRules(msg.sheetID, olStyleSheet);
         olStyleSheet.whenReady((styleSheet) => {
@@ -729,9 +820,49 @@ export default class DOMManager extends ListWalker<Message> {
           logger.error('NodeAnimationResult: Node not found', msg);
           return;
         }
-        vElem.applyStyleChanges(Object.entries(styles));
+        vElem.applyAnimationResult(styles);
       }
     }
+  };
+
+  /** Re-assert recorded <dialog> top-layer state (showModal/show/close) once the node is connected. */
+  private reconcileDialogModes = (): void => {
+    this.dialogFlushScheduled = false;
+    if (this.dialogModes.size === 0) return;
+    this.dialogModes.forEach((mode, id) => {
+      const vElem = this.vElements.get(id);
+      if (!vElem) {
+        this.dialogModes.delete(id);
+        return;
+      }
+      const node = vElem.node;
+      if (!isDialogElement(node) || !node.isConnected) {
+        return; // not mounted yet — retry next flush
+      }
+      // `:modal` is the only reliable read of top-layer membership (`open` is set for both).
+      let isModal = false;
+      try {
+        isModal = node.matches('dialog:modal');
+      } catch (e) {
+        /* :modal unsupported */
+      }
+      try {
+        if (mode === 'modal') {
+          if (!isModal) {
+            if (node.hasAttribute('open')) node.removeAttribute('open'); // showModal() throws if already open
+            node.showModal();
+          }
+        } else if (mode === 'nonmodal') {
+          if (isModal) node.close();
+          if (!node.open) node.show();
+        } else {
+          if (node.open || isModal) node.close();
+          this.dialogModes.delete(id); // 'closed' is terminal
+        }
+      } catch (e) {
+        logger.log('Dialog top-layer replay failed', id, mode, e);
+      }
+    });
   };
 
   private flushPendingSelectValues = (): void => {
@@ -744,7 +875,7 @@ export default class DOMManager extends ListWalker<Message> {
         return;
       }
       const node = vElem.node;
-      if (!(node instanceof HTMLSelectElement)) {
+      if (!isSelectElement(node)) {
         this.pendingSelectValues.delete(id);
         return;
       }
@@ -767,9 +898,41 @@ export default class DOMManager extends ListWalker<Message> {
    * @returns Promise that fulfills when necessary changes get applied
    *   (the async part exists mostly due to styles loading)
    */
+  private applyNodeScroll(node: Element, x: number, y: number) {
+    node.scrollLeft = x;
+    node.scrollTop = y;
+    if (Math.abs(node.scrollLeft - x) > 1 || Math.abs(node.scrollTop - y) > 1) {
+      this.clampedScrolls.set(node, { x, y, tries: 0 });
+      this.scheduleScrollRetry();
+    } else {
+      this.clampedScrolls.delete(node);
+    }
+  }
+
+  private scheduleScrollRetry() {
+    if (this.scrollRetryTimer !== null) return;
+    this.scrollRetryTimer = setTimeout(() => {
+      this.scrollRetryTimer = null;
+      this.clampedScrolls.forEach((s, node) => {
+        node.scrollLeft = s.x;
+        node.scrollTop = s.y;
+        const reached =
+          Math.abs(node.scrollLeft - s.x) <= 1 &&
+          Math.abs(node.scrollTop - s.y) <= 1;
+        if (reached || ++s.tries >= 20) this.clampedScrolls.delete(node);
+      });
+      if (this.clampedScrolls.size > 0) this.scheduleScrollRetry();
+    }, 100);
+  }
+
   async moveReady(t: number): Promise<void> {
     this.moveApply(t, this.applyMessage);
     this.olVRoots.forEach((rt) => rt.applyChanges());
+    // applyChanges() mutates the DOM on a microtask; reconcile dialogs after it (macrotask).
+    if (this.dialogModes.size > 0 && !this.dialogFlushScheduled) {
+      this.dialogFlushScheduled = true;
+      setTimeout(this.reconcileDialogModes, 0);
+    }
     if (this.pendingSelectValues.size > 0 && !this.flushScheduled) {
       this.flushScheduled = true;
       setTimeout(this.flushPendingSelectValues, 0);
@@ -793,8 +956,7 @@ export default class DOMManager extends ListWalker<Message> {
         if (msg) {
           let scrollVHost: VElement | OnloadVRoot | undefined;
           if ((scrollVHost = this.vElements.get(msg.id))) {
-            scrollVHost.node.scrollLeft = msg.x;
-            scrollVHost.node.scrollTop = msg.y;
+            this.applyNodeScroll(scrollVHost.node, msg.x, msg.y);
           } else if ((scrollVHost = this.olVRoots.get(msg.id))) {
             scrollVHost.whenReady((vNode) => {
               if (vNode instanceof VDocument) {

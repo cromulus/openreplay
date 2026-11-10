@@ -48,6 +48,16 @@ const searchEngineList = [
   'perplexity',
 ]
 
+function parseJSON(value: string | null): Record<string, any> | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 export default class ConstantProperties {
   os: string
   osVersion: string
@@ -69,7 +79,12 @@ export default class ConstantProperties {
     private readonly sessionStorage: StorageLike,
   ) {
     const { width, height, browser, browserVersion, browserMajorVersion, os, osVersion, mobile } =
-      uaParse(win)
+      uaParse(win, (refinedOsVersion) => {
+        // Windows 10/11 are indistinguishable from the UA string; the async
+        // high-entropy result lands after construction, so update it live here.
+        // `all` is a getter, so later events pick up the corrected value.
+        this.osVersion = refinedOsVersion
+      })
     const storedUserId = this.sessionStorage.getItem(userIdKey)
     if (storedUserId) {
       this.user_id = storedUserId
@@ -116,6 +131,7 @@ export default class ConstantProperties {
 
   resetUserId = (hard?: boolean) => {
     this.user_id = null
+    this.sessionStorage.setItem(userIdKey, '')
     if (hard) {
       this.deviceId = this.getDistinctDeviceId(true)
     }
@@ -153,11 +169,11 @@ export default class ConstantProperties {
 
   private parseUTM = () => {
     const potentialStored = this.sessionStorage.getItem(utmParamsKey)
-    if (potentialStored) {
-      const obj = JSON.parse(potentialStored)
-      this.utmSource = obj.utm_source
-      this.utmMedium = obj.utm_medium
-      this.utmCampaign = obj.utm_campaign
+    const stored = parseJSON(potentialStored)
+    if (stored) {
+      this.utmSource = stored.utm_source ?? null
+      this.utmMedium = stored.utm_medium ?? null
+      this.utmCampaign = stored.utm_campaign ?? null
     } else {
       const searchParams = new URLSearchParams(win.location.search)
       this.utmSource = searchParams.get('utm_source') || null
@@ -174,8 +190,16 @@ export default class ConstantProperties {
   }
 
   private getSearchEngine = (ref: string) => {
+    let host: string
+    try {
+      host = new URL(ref).hostname.toLowerCase()
+    } catch {
+      return null
+    }
+    // skip the TLD so e.g. example.info isn't taken for info.com
+    const labels = host.split('.').slice(0, -1)
     for (const searchEngine of searchEngineList) {
-      if (ref.includes(searchEngine)) {
+      if (labels.includes(searchEngine)) {
         return searchEngine
       }
     }
@@ -183,12 +207,7 @@ export default class ConstantProperties {
   }
 
   getSuperProperties = (): Record<string, any> => {
-    const potentialStored = this.localStorage.getItem(superPropKey)
-    if (potentialStored) {
-      return JSON.parse(potentialStored)
-    } else {
-      return {}
-    }
+    return parseJSON(this.localStorage.getItem(superPropKey)) ?? {}
   }
 
   saveSuperProperties = (props: Record<string, any>) => {

@@ -110,7 +110,7 @@ postgresql:
   image:
     registry: ghcr.io
     repository: openreplay/postgres
-    tag: 17
+    tag: 18
   enabled: true
   resources:
     limits:
@@ -125,13 +125,10 @@ minio:
   #  minio:
   #    accessKey: "{{ minio_access_key }}"
   #    secretKey: "{{ minio_secret_key }}"
-  deployment:
-    annotations:
-      argocd.argoproj.io/sync-options: Replace=true
   image:
     registry: docker.io
     repository: rustfs/rustfs
-    tag: 1.0.0-beta.1
+    tag: 1.0.0
   fullnameOverride: minio
   enabled: true
   resources:
@@ -232,7 +229,7 @@ kafka:
 # Enterprise dbs
 clickhouse:
   image:
-    tag: "26.2-alpine"
+    tag: "26.8-alpine"
   enabled: false
 
 # For enterpriseEdition Only

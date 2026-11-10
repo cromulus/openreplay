@@ -7,11 +7,11 @@ import (
 )
 
 const PageEventTimeout = 1 * 60 * 1000
+const maxLoadTiming = 30000
 
 type pageEventBuilder struct {
-	pageEvent          *PageEvent
-	firstTimingHandled bool
-	webVitals          map[string]string
+	pageEvent *PageEvent
+	webVitals map[string]string
 }
 
 func NewPageEventBuilder() *pageEventBuilder {
@@ -36,13 +36,15 @@ func (b *pageEventBuilder) Handle(message Message, timestamp uint64) Message {
 			return nil
 		}
 		if msg.NavigationStart == 0 { // routing without new page loading
-			return &PageEvent{
+			pageEvent := &PageEvent{
 				URL:       msg.URL,
 				Referrer:  msg.Referrer,
 				Loaded:    false,
 				MessageID: message.MsgID(),
 				Timestamp: timestamp,
 			}
+			pageEvent.Meta().SetMeta(message.Meta())
+			return pageEvent
 		} else {
 			pageEvent := b.Build()
 			b.pageEvent = &PageEvent{
@@ -52,6 +54,7 @@ func (b *pageEventBuilder) Handle(message Message, timestamp uint64) Message {
 				MessageID: message.MsgID(),
 				Timestamp: timestamp,
 			}
+			b.pageEvent.Meta().SetMeta(message.Meta())
 			return pageEvent
 		}
 	case MsgPageLoadTiming:
@@ -62,31 +65,31 @@ func (b *pageEventBuilder) Handle(message Message, timestamp uint64) Message {
 		if !ok {
 			return nil
 		}
-		if msg.RequestStart <= 30000 {
+		if msg.RequestStart <= maxLoadTiming {
 			b.pageEvent.RequestStart = msg.RequestStart
 		}
-		if msg.ResponseStart <= 30000 {
+		if msg.ResponseStart <= maxLoadTiming {
 			b.pageEvent.ResponseStart = msg.ResponseStart
 		}
-		if msg.ResponseEnd <= 30000 {
+		if msg.ResponseEnd <= maxLoadTiming {
 			b.pageEvent.ResponseEnd = msg.ResponseEnd
 		}
-		if msg.DomContentLoadedEventStart <= 30000 {
+		if msg.DomContentLoadedEventStart <= maxLoadTiming {
 			b.pageEvent.DomContentLoadedEventStart = msg.DomContentLoadedEventStart
 		}
-		if msg.DomContentLoadedEventEnd <= 30000 {
+		if msg.DomContentLoadedEventEnd <= maxLoadTiming {
 			b.pageEvent.DomContentLoadedEventEnd = msg.DomContentLoadedEventEnd
 		}
-		if msg.LoadEventStart <= 30000 {
+		if msg.LoadEventStart <= maxLoadTiming {
 			b.pageEvent.LoadEventStart = msg.LoadEventStart
 		}
-		if msg.LoadEventEnd <= 30000 {
+		if msg.LoadEventEnd <= maxLoadTiming {
 			b.pageEvent.LoadEventEnd = msg.LoadEventEnd
 		}
-		if msg.FirstPaint <= 30000 {
+		if msg.FirstPaint <= maxLoadTiming {
 			b.pageEvent.FirstPaint = msg.FirstPaint
 		}
-		if msg.FirstContentfulPaint <= 30000 {
+		if msg.FirstContentfulPaint <= maxLoadTiming {
 			b.pageEvent.FirstContentfulPaint = msg.FirstContentfulPaint
 		}
 		return nil
@@ -125,13 +128,13 @@ func (b *pageEventBuilder) Build() Message {
 	}
 	pageEvent := b.pageEvent
 	b.pageEvent = nil
-	b.firstTimingHandled = false
 	if b.webVitals != nil {
 		if vitals, err := json.Marshal(b.webVitals); err == nil {
 			pageEvent.WebVitals = string(vitals)
 		} else {
 			fmt.Printf("Error marshalling web vitals: %v\n", err)
 		}
+		b.webVitals = nil
 	}
 	return pageEvent
 }

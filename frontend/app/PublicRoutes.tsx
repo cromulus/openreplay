@@ -4,16 +4,17 @@ import React, { Suspense, lazy, useEffect } from 'react';
 import { useStore } from 'App/mstore';
 import * as routes from 'App/routes';
 import { Navigate, Route, StableRoutes } from 'App/routing';
-import Signup from 'Components/Signup/Signup';
 import { Loader } from 'UI';
-
-import SupportCallout from 'Shared/SupportCallout';
 
 const LOGIN_PATH = routes.login();
 const SIGNUP_PATH = routes.signup();
 const FORGOT_PASSWORD = routes.forgotPassword();
 const SPOT_PATH = routes.spot();
 
+// These were the only eager imports here, so their whole component trees rode
+// in the entry chunk next to the lazy routes they sit beside.
+const Signup = lazy(() => import('Components/Signup/Signup'));
+const SupportCallout = lazy(() => import('Shared/SupportCallout'));
 const Login = lazy(() => import('Components/Login/Login'));
 const ForgotPassword = lazy(
   () => import('Components/ForgotPassword/ForgotPassword'),

@@ -1,0 +1,59 @@
+\set previous_version 'v1.27.0'
+\set next_version 'v1.28.0'
+SELECT openreplay_version()                       AS current_version,
+       openreplay_version() = :'previous_version' AS valid_previous,
+       openreplay_version() = :'next_version'     AS is_next
+\gset
+
+\if :valid_previous
+\echo valid previous DB version :'previous_version', starting DB upgrade to :'next_version'
+BEGIN;
+SELECT format($fn_def$
+CREATE OR REPLACE FUNCTION openreplay_version()
+    RETURNS text AS
+$$
+SELECT '%1$s'
+$$ LANGUAGE sql IMMUTABLE;
+$fn_def$, :'next_version')
+\gexec
+
+--
+
+DROP TABLE IF EXISTS public.errors_tags;
+DROP TABLE IF EXISTS public.user_favorite_errors;
+DROP TABLE IF EXISTS events.errors;
+DROP TABLE IF EXISTS public.errors;
+DROP TYPE IF EXISTS error_source;
+DROP TYPE IF EXISTS error_status;
+
+CREATE INDEX IF NOT EXISTS sessions_notes_project_id_session_id_idx ON public.sessions_notes (project_id, session_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS dashboards_project_id_idx ON public.dashboards (project_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS dashboard_widgets_dashboard_id_metric_id_idx ON public.dashboard_widgets (dashboard_id, metric_id);
+DROP INDEX IF EXISTS public.user_favorite_sessions_user_id_session_id_idx;
+
+CREATE TABLE IF NOT EXISTS public.mcp_authentication_tokens
+(
+    user_id   integer                     NOT NULL REFERENCES public.users (user_id) ON DELETE CASCADE,
+    client_id text                        NOT NULL,
+    state     text                        NOT NULL,
+    jti       text                        NOT NULL DEFAULT generate_api_key(10),
+    iat       timestamp without time zone NULL     DEFAULT NULL,
+    generated bool                                 DEFAULT FALSE,
+    PRIMARY KEY (user_id, client_id, state)
+);
+
+CREATE TABLE IF NOT EXISTS public.mcp_app_users
+(
+    user_id    integer                     NOT NULL REFERENCES public.users (user_id) ON DELETE CASCADE,
+    client_id  text                        NOT NULL,
+    created_at timestamp without time zone NOT NULL DEFAULT (now() at time zone 'utc'),
+    PRIMARY KEY (user_id, client_id)
+);
+
+COMMIT;
+
+\elif :is_next
+\echo new version detected :'next_version', nothing to do
+\else
+\warn skipping DB upgrade of :'next_version', expected previous version :'previous_version', found :'current_version'
+\endif

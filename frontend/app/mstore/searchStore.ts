@@ -22,6 +22,31 @@ import Search from 'App/mstore/types/search';
 import { searchService, sessionService } from 'App/services';
 
 const PER_PAGE = 10;
+/* The whole saved-search list is loaded in one request and shared by every
+   consumer (session search, Data Management, the Issues capture layer). */
+const SAVED_SEARCH_PAGE_SIZE = 200;
+
+/* What the sessions/search handler actually binds. Applied at the request
+   boundary only — toSearch() output is also what gets persisted as saved-search
+   data and what the live-sessions endpoint receives, so it stays wider. */
+const SEARCH_REQUEST_FIELDS = [
+  'filters',
+  'startTimestamp',
+  'endTimestamp',
+  'sort',
+  'order',
+  'eventsOrder',
+  'limit',
+  'page',
+  'series',
+  'bookmarked',
+] as const;
+
+const pickSearchRequestFields = (filter: Record<string, any>) =>
+  SEARCH_REQUEST_FIELDS.reduce<Record<string, any>>((acc, key) => {
+    if (filter[key] !== undefined) acc[key] = filter[key];
+    return acc;
+  }, {});
 
 export const checkValues = (key: any, value: any) => {
   if (key === FilterKey.DURATION) {
@@ -102,12 +127,28 @@ class SearchStore {
   activeTags: any[] = [];
   urlParsed: boolean = false;
   searchInProgress = false;
-  savedSearchPage = 1;
-  savedSearchPageSize = 100;
+
+  /** Excluded from mobx: an observable proxy around it breaks abort(). */
+  searchAbort: AbortController | null = null;
   savedSearchTotal = 0;
+  /* untouched server rows behind `list` — Data Management builds its richer
+     Segment objects from these (SavedSearch drops the count/capture fields) */
+  savedSearchRaw: any[] = [];
+  savedSearchLoaded = false;
+  /* sessionsCount/usersCount are opt-in (withStats) — the sessions-list load
+     skips them, so Data Management has to know whether the cache carries them */
+  savedSearchHasStats = false;
+  /* one in-flight request shared by every caller, so the app-level load in
+     Router and the page-level loads don't each hit the endpoint */
+  private savedSearchRequest: { key: string; promise: Promise<void> } | null =
+    null;
 
   constructor() {
-    makeAutoObservable(this);
+    // the shared request handle is plumbing, not view state
+    makeAutoObservable(this, {
+      savedSearchRequest: false,
+      searchAbort: false,
+    } as any);
   }
 
   resetFilters = () => {
@@ -158,21 +199,67 @@ class SearchStore {
     this.currentPage = 1;
   }
 
-  async fetchSavedSearchList(page: number = 1, limit: number = 100) {
-    const offset = (page - 1) * limit;
-    const response = await searchService.fetchSavedSearch({ limit, offset });
-    runInAction(() => {
-      this.list =
-        response.data?.map((item: any) => new SavedSearch(item)) || [];
-      this.savedSearchTotal = response.total;
-      this.savedSearchPage = page;
-      this.savedSearchPageSize = limit;
-    });
+  fetchSavedSearchList(
+    page: number = 1,
+    limit: number = SAVED_SEARCH_PAGE_SIZE,
+    withStats = false,
+  ): Promise<void> {
+    const key = `${page}:${limit}:${withStats}`;
+    if (this.savedSearchRequest?.key === key) {
+      return this.savedSearchRequest.promise;
+    }
+    const promise = this.loadSavedSearchList(page, limit, withStats).finally(
+      () => {
+        if (this.savedSearchRequest?.key === key)
+          this.savedSearchRequest = null;
+      },
+    );
+    this.savedSearchRequest = { key, promise };
+    return promise;
   }
 
-  changeSavedSearchPage(page: number) {
-    this.savedSearchPage = page;
-    void this.fetchSavedSearchList(page, this.savedSearchPageSize);
+  private async loadSavedSearchList(
+    page: number,
+    limit: number,
+    withStats: boolean,
+  ) {
+    const offset = (page - 1) * limit;
+    try {
+      const response = await searchService.fetchSavedSearch({
+        limit,
+        offset,
+        withStats: withStats ? 1 : undefined,
+      });
+      runInAction(() => {
+        const rows: any[] = response.data || [];
+        this.savedSearchRaw = rows;
+        this.list = rows.map((item: any) => new SavedSearch(item));
+        this.savedSearchTotal = response.total ?? rows.length;
+        this.savedSearchLoaded = true;
+        this.savedSearchHasStats = withStats;
+      });
+    } catch (e) {
+      // the endpoint 400s on an out-of-range limit/offset; leaving the latch
+      // unset lets the next caller retry instead of reading an empty list
+      console.error('Failed to load saved searches:', e);
+    }
+  }
+
+  /** Load once per project — resolves immediately when the list is already in
+      state, and joins the in-flight request otherwise. Counts are only returned
+      when asked for, so a cached stats-less list is refetched for a caller that
+      needs them. */
+  ensureSavedSearchList(withStats = false): Promise<void> {
+    if (this.savedSearchLoaded && (!withStats || this.savedSearchHasStats)) {
+      return Promise.resolve();
+    }
+    return this.fetchSavedSearchList(1, SAVED_SEARCH_PAGE_SIZE, withStats);
+  }
+
+  /** Mark the cached list stale so the next `ensureSavedSearchList` refetches. */
+  invalidateSavedSearchList() {
+    this.savedSearchLoaded = false;
+    this.savedSearchHasStats = false;
   }
 
   async loadSharedSearch(searchId: string): Promise<void> {
@@ -425,6 +512,9 @@ class SearchStore {
 
   clearList() {
     this.list = [];
+    this.savedSearchRaw = [];
+    this.savedSearchLoaded = false;
+    this.savedSearchRequest = null;
   }
 
   clearSearch() {
@@ -532,7 +622,12 @@ class SearchStore {
     this.instance = new Search(inst);
     this.currentPage = 1;
 
-    if (filter.value && filter.value[0] && filter.value[0] !== '') {
+    const hasValue = Boolean(
+      filter.value && filter.value[0] && filter.value[0] !== '',
+    );
+    const isCustomEvent = Boolean(filter.isEvent) && !filter.autoCaptured;
+
+    if (hasValue || isCustomEvent) {
       void this.fetchSessions();
     }
   };
@@ -611,7 +706,10 @@ class SearchStore {
     force: boolean = false,
     bookmarked: boolean = false,
   ): Promise<void> {
-    if (this.searchInProgress) return;
+    const superseded = Boolean(this.searchAbort);
+    this.searchAbort?.abort();
+    const controller = new AbortController();
+    this.searchAbort = controller;
 
     let filter = this.instance.toSearch();
     filter = this.applyTagFilter(filter, this.activeTags);
@@ -619,19 +717,29 @@ class SearchStore {
     this.latestRequestTime = filter.startDate;
     this.latestList = [];
     this.searchInProgress = true;
-    await sessionStore
-      .fetchSessions(
+    try {
+      await sessionStore.fetchSessions(
         {
-          ...filter,
+          ...pickSearchRequestFields(filter),
           page: this.currentPage,
           limit: this.pageSize,
           bookmarked: bookmarked ? true : undefined,
         },
-        force,
-      )
-      .finally(() => {
-        this.searchInProgress = false;
-      });
+        // SessionStore skips a search whose filters match the persisted ones —
+        // including the ones the aborted request just wrote.
+        force || superseded,
+        controller.signal,
+      );
+    } catch (e) {
+      if (!controller.signal.aborted) throw e;
+    } finally {
+      if (this.searchAbort === controller) {
+        runInAction(() => {
+          this.searchAbort = null;
+          this.searchInProgress = false;
+        });
+      }
+    }
   }
 
   private applyTagFilter(filter: any, activeTags: string[]): any {

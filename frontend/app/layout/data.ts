@@ -1,7 +1,14 @@
 import { TFunction } from 'i18next';
-import { IconNames } from '../components/ui/SVG';
 import React from 'react';
-import { menuHidden } from 'App/utils/split-utils';
+
+import {
+  agentIssuesEnabled,
+  agentTestsEnabled,
+  anyAgentEnabled,
+  menuHidden,
+} from 'App/utils/split-utils';
+
+import { IconNames } from '../components/ui/SVG';
 
 export interface MenuItem {
   label: React.ReactNode;
@@ -14,6 +21,7 @@ export interface MenuItem {
   leading?: any;
   isEnterprise?: boolean;
   isAdmin?: boolean;
+  tag?: { label: string; color: string; border?: boolean };
 }
 
 interface Category {
@@ -36,6 +44,8 @@ export const enum PREFERENCES_MENU {
   NOTIFICATIONS = 'notifications',
   BILLING = 'billing',
   EXPORTED_VIDEOS = 'exported-videos',
+  TEST_AGENTS = 'test-agents',
+  AGENTS = 'agents',
 }
 
 export const enum MENU {
@@ -54,6 +64,8 @@ export const enum MENU {
   SUPPORT = 'support',
   EXIT = 'exit',
   SPOTS = 'spots',
+  AGENTS = 'agents',
+  TEST_AGENTS = 'agents-tests',
   ACTIVITY = 'activity',
   USER = 'user-page',
   USERS = 'data-users',
@@ -62,6 +74,7 @@ export const enum MENU {
   DATA_MANAGEMENT = 'data-management',
   SEGMENTS = 'data-segments',
   TAGS = 'data-tags',
+  ISSUES = 'issues',
 }
 
 export const categories: (t: TFunction) => Category[] = (t) => [
@@ -96,6 +109,35 @@ export const categories: (t: TFunction) => Category[] = (t) => [
     ],
   },
   {
+    title: t('Agents'),
+    key: 'agents',
+    hidden: !anyAgentEnabled(),
+    items: [
+      {
+        label: t('Agents'),
+        key: MENU.AGENTS,
+        icon: 'scan-pulse',
+        tag: {
+          label: t('New'),
+          color: '#394DFE',
+        },
+        hidden: !anyAgentEnabled(),
+        children: [
+          {
+            label: t('Issues'),
+            key: MENU.ISSUES,
+            hidden: !agentIssuesEnabled(),
+          },
+          {
+            label: t('Tests'),
+            key: MENU.TEST_AGENTS,
+            hidden: !agentTestsEnabled(),
+          },
+        ],
+      },
+    ],
+  },
+  {
     title: '',
     key: 'spot',
     items: [{ label: t('Spots'), key: MENU.SPOTS, icon: 'orspotOutline' }],
@@ -113,14 +155,6 @@ export const categories: (t: TFunction) => Category[] = (t) => [
     items: [
       { label: t('Dashboards'), key: MENU.DASHBOARDS, icon: 'columns-gap' },
       { label: t('Cards'), key: MENU.CARDS, icon: 'bar-chart-line' },
-      // {
-      //   label: 'Cards', key: MENU.CARDS, icon: 'bar-chart-line', children: [
-      //     { label: 'All', key: MENU.CARDS },
-      //     { label: 'Funnels', key: MENU.FUNNELS },
-      //     { label: 'Error Tracking', key: MENU.ERROR_TRACKING },
-      //     { label: 'Resource Monitoring', key: MENU.RESOURCE_MONITORING }
-      //   ]
-      // },
       { label: t('Alerts'), key: MENU.ALERTS, icon: 'bell' },
     ],
   },
@@ -140,15 +174,15 @@ export const categories: (t: TFunction) => Category[] = (t) => [
         hidden: menuHidden.dataAnalytics,
         key: MENU.DATA_MANAGEMENT,
         icon: 'memory',
-        tag: {
-          label: t('New'),
-          color: '#394DFE',
-        },
         children: [
           { label: 'People', key: MENU.USERS },
           { label: 'Events', key: MENU.EVENTS, hidden: menuHidden.lexicon },
           { label: 'Properties', key: MENU.PROPS, hidden: menuHidden.lexicon },
-          { label: 'Segments', key: MENU.SEGMENTS, hidden: menuHidden.segments },
+          {
+            label: 'Segments',
+            key: MENU.SEGMENTS,
+            hidden: menuHidden.segments,
+          },
           { label: 'Features', key: MENU.TAGS },
         ],
       },
@@ -234,6 +268,15 @@ export const preferences: (t: TFunction) => Category[] = (t) => [
         key: PREFERENCES_MENU.EXPORTED_VIDEOS,
         icon: 'ic-network',
         hidden: menuHidden.videoExport,
+      },
+      {
+        // shared preferences for the agents: journey tags, critical rules,
+        // notifications by category + behaviour toggles. Core config
+        // (environments, run defaults) stays with each agent's page.
+        label: t('Agents'),
+        key: PREFERENCES_MENU.AGENTS,
+        icon: 'scan-pulse',
+        hidden: !anyAgentEnabled(),
       },
     ],
   },

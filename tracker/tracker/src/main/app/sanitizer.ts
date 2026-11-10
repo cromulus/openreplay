@@ -34,11 +34,39 @@ export interface Options {
   domSanitizer?: (node: Element) => SanitizeLevel
   /**
    * private by default mode that will mask all elements not marked by data-openreplay-unmask
+   * (unmask applies to the marked element and all of its descendants)
    * */
   privateMode?: boolean
 }
 
-export const stringWiper = (input: string) =>
+const UNMASK_SELECTOR = '[data-openreplay-unmask]'
+const MASK_SELECTOR = '[data-openreplay-obscured],[data-openreplay-masked]'
+
+// closest() that continues through shadow roots up to their hosts
+function closestComposed(el: Element, selector: string): Element | null {
+  let current: Element | null = el
+  while (current) {
+    const match = current.closest(selector)
+    if (match) {
+      return match
+    }
+    // nodeType check instead of instanceof: shadow roots inside iframes belong to another realm
+    const root = current.getRootNode() as ShadowRoot
+    current = root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host ? root.host : null
+  }
+  return null
+}
+
+// Unmask applies to the whole subtree, including content of shadow roots under an unmasked host.
+const isUnmasked = (el: Element) => closestComposed(el, UNMASK_SELECTOR) !== null
+
+function composedParentElement(node: Node): Element | null {
+  if (node.parentElement) return node.parentElement
+  const root = node.parentNode as ShadowRoot | null
+  return root && root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host ? root.host : null
+}
+
+export const stringWiper =(input: string) =>
   input
     .trim()
     .replace(/[^\f\n\r\t\v\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff\s]/g, '*')
@@ -67,12 +95,27 @@ export default class Sanitizer {
   // Reading current state on every call is what lets resanitize() pick up
   // runtime attribute/domSanitizer changes.
   computeLevel(node: Node, parentLevel: SanitizeLevel): SanitizeLevel {
+    // privateMode default masking is a floor: hidden rules below still apply
+    let privateObscured = false
     if (this.options.privateMode) {
-      if (isElementNode(node) && !hasOpenreplayAttribute(node, 'unmask')) {
-        return SanitizeLevel.Obscured
-      }
-      if (isTextNode(node) && !hasOpenreplayAttribute(node.parentNode as Element, 'unmask')) {
-        return SanitizeLevel.Obscured
+      if (isElementNode(node)) {
+        if (!isUnmasked(node)) {
+          privateObscured = true
+        } else {
+          const parent = composedParentElement(node)
+          // Root of an unmasked region: its parent is obscured only by privateMode itself,
+          // so inherit just explicit masks (or hidden), not the private default.
+          if (parentLevel === SanitizeLevel.Obscured && !(parent && isUnmasked(parent))) {
+            parentLevel = closestComposed(node, MASK_SELECTOR)
+              ? SanitizeLevel.Obscured
+              : SanitizeLevel.Plain
+          }
+        }
+      } else if (isTextNode(node)) {
+        const parent = composedParentElement(node)
+        if (!(parent && isUnmasked(parent))) {
+          privateObscured = true
+        }
       }
     }
 
@@ -103,6 +146,9 @@ export default class Sanitizer {
       }
     }
 
+    if (privateObscured && level < SanitizeLevel.Obscured) {
+      level = SanitizeLevel.Obscured
+    }
     return level
   }
 
@@ -139,10 +185,18 @@ export default class Sanitizer {
       data = data.replace(/\d/g, '0')
     }
     if (this.options.obscureTextEmails) {
-      data = data.replace(/^\w+([+.-]\w+)*@\w+([.-]\w+)*\.\w{2,3}$/g, (email) => {
-        const [name, domain] = email.split('@')
-        const [domainName, host] = domain.split('.')
-        return `${stars(name)}@${stars(domainName)}.${stars(host)}`
+      // Match every email-like substring anywhere in the text (not just when the
+      // whole node is a single email), and preserve every domain label including
+      // multi-part TLDs (e.g. .co.uk) so nothing leaks through unmasked.
+      data = data.replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, (email) => {
+        const atIdx = email.lastIndexOf('@')
+        const name = email.slice(0, atIdx)
+        const domain = email.slice(atIdx + 1)
+        const maskedDomain = domain
+          .split('.')
+          .map((part) => stars(part))
+          .join('.')
+        return `${stars(name)}@${maskedDomain}`
       })
     }
     return data
@@ -158,7 +212,7 @@ export default class Sanitizer {
 
   getInnerTextSecure(el: HTMLElement): string {
     const id = this.app.nodes.getID(el)
-    if (!id) {
+    if (id === undefined) {
       return ''
     }
     return this.sanitize(id, el.innerText)

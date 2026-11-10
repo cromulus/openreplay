@@ -110,9 +110,11 @@ def reset_member(tenant_id, editor_id, user_id_to_update):
     admin = get_user(tenant_id=tenant_id, user_id=editor_id)
     if not admin["admin"] and not admin["superAdmin"]:
         return {"errors": ["unauthorized"]}
-    user = get_user(tenant_id=tenant_id, user_id=user_id_to_update)
+    user = get_member(tenant_id=tenant_id, user_id=user_id_to_update)
     if not user:
         return {"errors": ["user not found"]}
+    if user["superAdmin"] or user["joined"]:
+        return {"errors": ["unauthorized"]}
     return {"data": {"invitationLink": generate_new_invitation(user_id_to_update)}}
 
 
@@ -363,8 +365,9 @@ def get_member(tenant_id, user_id):
         u = helper.dict_to_camel_case(cur.fetchone())
         if u:
             u["createdAt"] = TimeUTC.datetime_to_timestamp(u["createdAt"])
-            if u["invitationToken"]:
-                u["invitationLink"] = __get_invitation_link(u.pop("invitationToken"))
+            invitation_token = u.pop("invitationToken")
+            if invitation_token and not u["joined"]:
+                u["invitationLink"] = __get_invitation_link(invitation_token)
             else:
                 u["invitationLink"] = None
 
@@ -396,8 +399,9 @@ def get_members(tenant_id):
             r = helper.list_to_camel_case(r)
             for u in r:
                 u["createdAt"] = TimeUTC.datetime_to_timestamp(u["createdAt"])
-                if u["invitationToken"]:
-                    u["invitationLink"] = __get_invitation_link(u.pop("invitationToken"))
+                invitation_token = u.pop("invitationToken")
+                if invitation_token and not u["joined"]:
+                    u["invitationLink"] = __get_invitation_link(invitation_token)
                 else:
                     u["invitationLink"] = None
             return r
@@ -580,7 +584,7 @@ def get_by_invitation_token(token, pass_token=None):
     return helper.dict_to_camel_case(r)
 
 
-def auth_exists(user_id, jwt_iat) -> bool:
+def auth_exists(user_id, jwt_iat, skip_iat: bool = False) -> bool:
     with pg_client.PostgresClient() as cur:
         cur.execute(
             cur.mogrify(f"""SELECT user_id, EXTRACT(epoch FROM jwt_iat)::BIGINT AS jwt_iat 
@@ -592,8 +596,9 @@ def auth_exists(user_id, jwt_iat) -> bool:
         )
         r = cur.fetchone()
     return r is not None \
-        and r.get("jwt_iat") is not None \
-        and abs(jwt_iat - r["jwt_iat"]) <= 1
+        and (skip_iat or \
+             r.get("jwt_iat") is not None \
+             and abs(jwt_iat - r["jwt_iat"]) <= 1)
 
 
 def refresh_auth_exists(user_id, jwt_jti=None):

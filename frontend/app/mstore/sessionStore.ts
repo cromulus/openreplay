@@ -10,7 +10,7 @@ import {
   getSessionFilter,
   setSessionFilter,
 } from 'App/utils';
-import { loadFile } from 'App/player/web/network/loadFiles';
+import { loadFile } from 'Player/web/network/loadFiles';
 import { LAST_7_DAYS } from 'Types/app/period';
 import { filterMap } from 'App/mstore/searchStore';
 import { getDateRangeFromValue } from 'App/dateRange';
@@ -182,6 +182,11 @@ export default class SessionStore {
     userTime: '',
   };
 
+  /** AI-detected issue markers to overlay on the player timeline (ms from
+      session start). Empty for a regular session; populated by the issue
+      player. */
+  timelineIssues: { time: number; label?: string }[] = [];
+
   createNoteTooltip = {
     time: 0,
     isVisible: false,
@@ -299,7 +304,11 @@ export default class SessionStore {
     }
   };
 
-  fetchSessions = async (params = {}, force = false) => {
+  fetchSessions = async (
+    params = {},
+    force = false,
+    abortSignal?: AbortSignal,
+  ) => {
     runInAction(() => {
       this.loadingSessions = true;
     });
@@ -311,7 +320,8 @@ export default class SessionStore {
         }
       }
       setSessionFilter(cleanSessionFilters(params));
-      const data = await sessionService.getSessions(params);
+      const data = await sessionService.getSessions(params, abortSignal);
+      if (abortSignal?.aborted) return;
       const list = data.sessions.map((s) => new Session(s));
       runInAction(() => {
         this.list = list;
@@ -320,11 +330,15 @@ export default class SessionStore {
         this.favoriteList = list.filter((s) => s.favorite);
       });
     } catch (e) {
+      if (abortSignal?.aborted) throw e;
       console.error(e);
     } finally {
-      runInAction(() => {
-        this.loadingSessions = false;
-      });
+      // A superseded search has already handed the spinner to its replacement.
+      if (!abortSignal?.aborted) {
+        runInAction(() => {
+          this.loadingSessions = false;
+        });
+      }
     }
   };
 
@@ -554,18 +568,6 @@ export default class SessionStore {
     }
   };
 
-  sortSessions = (sortKey: string, sign: number = 1) => {
-    const comparator = (s1: Session, s2: Session) => {
-      // @ts-ignore
-      let diff = s1[sortKey] - s2[sortKey];
-      diff = diff === 0 ? s1.startedAt - s2.startedAt : diff;
-      return sign * diff;
-    };
-
-    this.list = this.list.slice().sort(comparator);
-    this.favoriteList = this.favoriteList.slice().sort(comparator);
-  };
-
   setActiveTab = (tab: { type: string; name: string }) => {
     const list =
       tab.type === 'all'
@@ -604,6 +606,10 @@ export default class SessionStore {
     this.timeLineTooltip = tp;
   };
 
+  setTimelineIssues = (issues: { time: number; label?: string }[]) => {
+    this.timelineIssues = issues;
+  };
+
   setCreateNoteTooltip = (noteTooltip: any) => {
     this.createNoteTooltip = noteTooltip;
   };
@@ -628,6 +634,7 @@ export default class SessionStore {
     this.eventsIndex = [];
     this.visitedEvents = [];
     this.host = '';
+    this.timelineIssues = [];
   };
 
   prefetchSession = (sessionData: Session) => {

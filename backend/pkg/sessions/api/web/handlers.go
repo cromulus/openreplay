@@ -17,11 +17,13 @@ import (
 	"openreplay/backend/internal/http/geoip"
 	"openreplay/backend/internal/http/uaparser"
 	"openreplay/backend/internal/http/uuid"
+	"openreplay/backend/pkg/cleanup/registry"
 	"openreplay/backend/pkg/conditions"
 	"openreplay/backend/pkg/db/postgres"
 	"openreplay/backend/pkg/flakeid"
 	"openreplay/backend/pkg/logger"
 	. "openreplay/backend/pkg/messages"
+	webmetrics "openreplay/backend/pkg/metrics/web"
 	"openreplay/backend/pkg/projects"
 	"openreplay/backend/pkg/queue/types"
 	"openreplay/backend/pkg/server/api"
@@ -43,11 +45,13 @@ type handlersImpl struct {
 	conditions      conditions.Conditions
 	flaker          *flakeid.Flaker
 	beaconSizeCache *beacons.BeaconCache
+	cleanupReg      registry.Registry
+	metrics         webmetrics.Web
 }
 
 func NewHandlers(cfg *httpCfg.Config, log logger.Logger, responser api.Responser, producer types.Producer, projects projects.Projects,
 	sessions sessions.Sessions, uaParser *uaparser.UAParser, geoIP geoip.GeoParser, tokenizer *token.Tokenizer,
-	conditions conditions.Conditions, flaker *flakeid.Flaker) (api.Handlers, error) {
+	conditions conditions.Conditions, flaker *flakeid.Flaker, cleanupReg registry.Registry, metrics webmetrics.Web) (api.Handlers, error) {
 	return &handlersImpl{
 		log:             log,
 		cfg:             cfg,
@@ -61,7 +65,14 @@ func NewHandlers(cfg *httpCfg.Config, log logger.Logger, responser api.Responser
 		conditions:      conditions,
 		flaker:          flaker,
 		beaconSizeCache: beacons.NewBeaconCache(cfg.BeaconSizeLimit),
+		cleanupReg:      cleanupReg,
+		metrics:         metrics,
 	}, nil
+}
+
+func (e *handlersImpl) rejectStart(w http.ResponseWriter, r *http.Request, code int, err error, startTime time.Time, bodySize int, reason string) {
+	e.metrics.IncreaseStartRejects("web", reason)
+	e.responser.ResponseWithError(e.log, r.Context(), w, code, err, startTime, r.URL.Path, bodySize)
 }
 
 func (e *handlersImpl) GetAll() []*api.Description {
@@ -107,13 +118,13 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 
 	// Check request body
 	if r.Body == nil {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, errors.New("request body is empty"), startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusBadRequest, errors.New("request body is empty"), startTime, bodySize, webmetrics.RejectEmptyBody)
 		return
 	}
 
 	bodyBytes, err := api.ReadCompressedBody(e.log, w, r, e.cfg.JsonSizeLimit)
 	if err != nil {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusRequestEntityTooLarge, err, startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusRequestEntityTooLarge, err, startTime, bodySize, webmetrics.RejectTooLarge)
 		return
 	}
 	bodySize = len(bodyBytes)
@@ -121,7 +132,7 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 	// Parse request body
 	req := &StartSessionRequest{}
 	if err := json.Unmarshal(bodyBytes, req); err != nil {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, err, startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusBadRequest, err, startTime, bodySize, webmetrics.RejectBadJSON)
 		return
 	}
 
@@ -129,13 +140,13 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 	r = r.WithContext(context.WithValue(r.Context(), "tracker", req.TrackerVersion))
 	if err := validateTrackerVersion(req.TrackerVersion); err != nil {
 		e.log.Error(r.Context(), "unsupported tracker version: %s, err: %s", req.TrackerVersion, err)
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusUpgradeRequired, errors.New("please upgrade the tracker version"), startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusUpgradeRequired, errors.New("please upgrade the tracker version"), startTime, bodySize, webmetrics.RejectTrackerOutdated)
 		return
 	}
 
 	// Handler's logic
 	if req.ProjectKey == nil {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusForbidden, errors.New("ProjectKey value required"), startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusForbidden, errors.New("ProjectKey value required"), startTime, bodySize, webmetrics.RejectNoProjectKey)
 		return
 	}
 
@@ -143,10 +154,10 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		if postgres.IsNoRowsErr(err) {
 			logErr := fmt.Errorf("project doesn't exist or is not active, key: %s", *req.ProjectKey)
-			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusNotFound, logErr, startTime, r.URL.Path, bodySize)
+			e.rejectStart(w, r, http.StatusNotFound, logErr, startTime, bodySize, webmetrics.RejectProjectNotFound)
 		} else {
 			e.log.Error(r.Context(), "failed to get project by key: %s, err: %s", *req.ProjectKey, err)
-			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, errors.New("can't find a project"), startTime, r.URL.Path, bodySize)
+			e.rejectStart(w, r, http.StatusInternalServerError, errors.New("can't find a project"), startTime, bodySize, webmetrics.RejectProjectError)
 		}
 		return
 	}
@@ -156,13 +167,13 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 
 	// Check if the project supports mobile sessions
 	if !p.IsWeb() {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusForbidden, errors.New("project doesn't support web sessions"), startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusForbidden, errors.New("project doesn't support web sessions"), startTime, bodySize, webmetrics.RejectPlatformUnsupported)
 		return
 	}
 
 	ua := e.uaParser.ParseFromHTTPRequest(r)
 	if ua == nil {
-		e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusForbidden, fmt.Errorf("browser not recognized, user-agent: %s", r.Header.Get("User-Agent")), startTime, r.URL.Path, bodySize)
+		e.rejectStart(w, r, http.StatusForbidden, fmt.Errorf("browser not recognized, user-agent: %s", r.Header.Get("User-Agent")), startTime, bodySize, webmetrics.RejectBrowserUnrecognized)
 		return
 	}
 
@@ -170,7 +181,7 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 
 	userUUID := uuid.GetUUID(req.UserUUID)
 	tokenData, err := e.tokenizer.Parse(req.Token)
-	if err != nil || req.Reset { // Starting the new one
+	if err != nil || req.Reset || (tokenData.ProjectID != 0 && tokenData.ProjectID != p.ProjectID) { // Starting the new one
 		dice := byte(rand.Intn(100))
 		// Use condition rate if it's set
 		if req.Condition != "" {
@@ -182,22 +193,23 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 			}
 		}
 		if dice >= p.SampleRate {
-			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusForbidden, fmt.Errorf("capture rate miss, rate: %d", p.SampleRate), startTime, r.URL.Path, bodySize)
+			e.rejectStart(w, r, http.StatusForbidden, fmt.Errorf("capture rate miss, rate: %d", p.SampleRate), startTime, bodySize, webmetrics.RejectSampleRateMiss)
 			return
 		}
 
 		startTimeMili := startTime.UnixMilli()
 		sessionID, err := e.flaker.Compose(uint64(startTimeMili))
 		if err != nil {
-			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusInternalServerError, err, startTime, r.URL.Path, bodySize)
+			e.rejectStart(w, r, http.StatusInternalServerError, err, startTime, bodySize, webmetrics.RejectInternalError)
 			return
 		}
 
 		expTime := startTime.Add(time.Duration(p.MaxSessionDuration) * time.Millisecond)
 		tokenData = &token.TokenData{
-			ID:      sessionID,
-			Delay:   startTimeMili - req.Timestamp,
-			ExpTime: expTime.UnixMilli(),
+			ID:        sessionID,
+			Delay:     startTimeMili - req.Timestamp,
+			ExpTime:   expTime.UnixMilli(),
+			ProjectID: p.ProjectID,
 		}
 
 		// Add sessionID to context
@@ -258,6 +270,7 @@ func (e *handlersImpl) startSessionHandlerWeb(w http.ResponseWriter, r *http.Req
 			}
 		}
 	} else {
+		tokenData.ProjectID = p.ProjectID // legacy token without project part
 		r = r.WithContext(context.WithValue(r.Context(), "sessionID", fmt.Sprintf("%d", tokenData.ID)))
 	}
 
@@ -352,22 +365,63 @@ func (e *handlersImpl) pushMessagesHandlerWeb(w http.ResponseWriter, r *http.Req
 	}
 	bodySize = len(bodyBytes)
 
-	topic := e.cfg.TopicRawWeb
-	switch batchType {
-	case "assets":
-		topic = e.cfg.TopicRawAssets
-	default: // "analytics", "devtools", "replay"
-		topic = e.cfg.TopicRawWeb
+	if len(bodyBytes) > 0 {
+		e.cleanupReg.Register(sessionData.ID, false, sessionData.ExpTime+registry.DeadlineGraceMs)
 	}
-	err = e.producer.Produce(topic, sessionData.ID, bodyBytes)
-	if err != nil {
-		e.log.Error(r.Context(), "can't send messages batch to queue: %s", err)
-		errCode := http.StatusInternalServerError
-		if tokenJustExpired {
-			errCode = http.StatusUnauthorized
+
+	if batchType == "visual" {
+		// parse split url parameter
+		splitString := r.URL.Query().Get("split")
+		if splitString == "" {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, errors.New("split value is empty"), startTime, r.URL.Path, bodySize)
+			return
 		}
-		e.responser.ResponseWithError(e.log, r.Context(), w, errCode, errors.New("can't save message, try again"), startTime, r.URL.Path, bodySize)
-		return
+		split, err := strconv.Atoi(splitString)
+		if err != nil {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, err, startTime, r.URL.Path, bodySize)
+			return
+		}
+		if split <= 0 || split >= bodySize {
+			e.responser.ResponseWithError(e.log, r.Context(), w, http.StatusBadRequest, errors.New("split value is out of range"), startTime, r.URL.Path, bodySize)
+			return
+		}
+
+		// split batches [player]split[assets] and send them to 2 different topics
+		errs := make([]error, 0)
+		if err = e.producer.Produce(e.cfg.TopicRawWeb, sessionData.ID, bodyBytes[:split]); err != nil {
+			errs = append(errs, err)
+		}
+		if err = e.producer.Produce(e.cfg.TopicRawAssets, sessionData.ID, bodyBytes[split:]); err != nil {
+			errs = append(errs, err)
+		}
+
+		if len(errs) > 0 {
+			errCode := http.StatusInternalServerError
+			if tokenJustExpired {
+				errCode = http.StatusUnauthorized
+			}
+			e.responser.ResponseWithError(e.log, r.Context(), w, errCode, errors.Join(errs...), startTime, r.URL.Path, bodySize)
+			return
+		}
+	} else {
+		topic := e.cfg.TopicRawWeb
+		switch batchType {
+		case "assets":
+			topic = e.cfg.TopicRawAssets
+		default: // "analytics", "devtools", "replay"
+			topic = e.cfg.TopicRawWeb
+		}
+
+		err = e.producer.Produce(topic, sessionData.ID, bodyBytes)
+		if err != nil {
+			e.log.Error(r.Context(), "can't send messages batch to queue: %s", err)
+			errCode := http.StatusInternalServerError
+			if tokenJustExpired {
+				errCode = http.StatusUnauthorized
+			}
+			e.responser.ResponseWithError(e.log, r.Context(), w, errCode, errors.New("can't save message, try again"), startTime, r.URL.Path, bodySize)
+			return
+		}
 	}
 
 	if tokenJustExpired {

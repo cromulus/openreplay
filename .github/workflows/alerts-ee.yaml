@@ -66,7 +66,7 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG_BASE}-ee" >> $GITHUB_ENV
           echo "IMAGE_TAG_BASE=${IMAGE_TAG_BASE}" >> $GITHUB_ENV
 
-      - uses: azure/k8s-set-context@v4
+      - uses: azure/k8s-set-context@v5
         with:
           method: kubeconfig
           kubeconfig: ${{ secrets.EE_KUBECONFIG }} # Use content of kubeconfig in secret.
@@ -139,11 +139,15 @@ jobs:
 
           # Update changed image tag
           sed -i "/alerts/{n;n;n;s/.*/    tag: ${IMAGE_TAG}/}" /tmp/image_override.yaml
+          # Ensure alerts entry exists even if no pod is running
+          if ! grep -q "^alerts:" /tmp/image_override.yaml; then
+            printf 'alerts:\n  image:\n    tag: %s\n' "${IMAGE_TAG}" >> /tmp/image_override.yaml
+          fi
 
           cat /tmp/image_override.yaml
           # Deploy command
           mkdir -p /tmp/charts
-          mv openreplay/charts/{ingress-nginx,alerts,connector,assist-api} /tmp/charts/
+          mv openreplay/charts/{ingress-nginx,alerts,connector} /tmp/charts/
           rm -rf  openreplay/charts/*
           mv /tmp/charts/* openreplay/charts/
           helm template openreplay -n app openreplay -f vars.yaml -f /tmp/image_override.yaml --set ingress-nginx.enabled=false --set skipMigration=true --no-hooks --kube-version=$k_version | kubectl apply -f -

@@ -1,10 +1,14 @@
-import { Button, Drawer } from 'antd';
+import { Button, Drawer, Tooltip } from 'antd';
+import cn from 'classnames';
 import { Menu, X } from 'lucide-react';
 import { observer } from 'mobx-react-lite';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
+import { Icon } from 'UI';
 
+import Logo from 'App/layout/Logo';
 import SupportModal from 'App/layout/SupportModal';
+import OnboardingMenu from 'Components/Onboarding/components/SideMenu';
 import { useStore } from 'App/mstore';
 import * as routes from 'App/routes';
 import {
@@ -16,6 +20,7 @@ import {
 import { useLocation, useNavigate } from 'App/routing';
 // added: util-based mobile detection
 import { mobileScreen } from 'App/utils/isMobile';
+import { agentIssuesEnabled, agentTestsEnabled } from 'App/utils/split-utils';
 import { MODULES } from 'Components/Client/Modules/extra';
 
 import {
@@ -37,11 +42,13 @@ function SideMenu(props: Props) {
   const { isCollapsed } = props;
 
   const isPreferencesActive = location.pathname.includes('/client/');
+  // onboarding swaps the menu body but keeps the sider chrome around it
+  const isOnboarding = location.pathname.includes('/onboarding/');
   const [supportOpen, setSupportOpen] = React.useState(false);
   // added: mobile drawer state
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
 
-  const { projectsStore, userStore } = useStore();
+  const { projectsStore, userStore, settingsStore } = useStore();
   const { account } = userStore;
   const modules = account.settings?.modules ?? [];
   const isAdmin = account.admin || account.superAdmin;
@@ -50,6 +57,10 @@ function SideMenu(props: Props) {
   // added: call util once per render
   const isMobile = mobileScreen;
   const { t, i18n } = useTranslation();
+
+  // plan features land with /account, so the memo has to recompute once they do
+  const hasIssuesAgent = agentIssuesEnabled();
+  const hasTestsAgent = agentTestsEnabled();
 
   const menu: any[] = React.useMemo(() => {
     const sourceMenu = isPreferencesActive ? preferences(t) : main_menu(t);
@@ -91,6 +102,8 @@ function SideMenu(props: Props) {
     siteId,
     i18n.language,
     isMobile, // added dep
+    hasIssuesAgent,
+    hasTestsAgent,
   ]);
 
   const menuRoutes: any = {
@@ -112,12 +125,14 @@ function SideMenu(props: Props) {
     [PREFERENCES_MENU.PROJECTS]: () => client(CLIENT_TABS.SITES),
     [PREFERENCES_MENU.ROLES_ACCESS]: () => client(CLIENT_TABS.MANAGE_ROLES),
     [PREFERENCES_MENU.AUDIT]: () => client(CLIENT_TABS.AUDIT),
+    [PREFERENCES_MENU.AGENTS]: () => client(CLIENT_TABS.AGENTS),
     [PREFERENCES_MENU.TEAM]: () => client(CLIENT_TABS.MANAGE_USERS),
     [PREFERENCES_MENU.NOTIFICATIONS]: () => client(CLIENT_TABS.NOTIFICATIONS),
     [PREFERENCES_MENU.BILLING]: () => client(CLIENT_TABS.BILLING),
     [PREFERENCES_MENU.MODULES]: () => client(CLIENT_TABS.MODULES),
     [MENU.HIGHLIGHTS]: () => withSiteId(routes.highlights(), siteId),
     [PREFERENCES_MENU.EXPORTED_VIDEOS]: () => client(CLIENT_TABS.VIDEOS),
+    [PREFERENCES_MENU.TEST_AGENTS]: () => client(CLIENT_TABS.TEST_AGENTS),
     [MENU.ACTIVITY]: () => withSiteId(routes.dataManagement.activity(), siteId),
     [MENU.USERS]: () => withSiteId(routes.dataManagement.usersList(), siteId),
     [MENU.EVENTS]: () => withSiteId(routes.dataManagement.eventsList(), siteId),
@@ -149,12 +164,48 @@ function SideMenu(props: Props) {
   return (
     <>
       {!isMobile && (
-        <MenuContent
-          menu={menu}
-          isMenuItemActive={isMenuItemActive}
-          handleClick={handleClick}
-          isCollapsed={isCollapsed}
-        />
+        <>
+          <div
+            className={cn(
+              'flex items-center h-[60px] shrink-0',
+              isCollapsed ? 'justify-center gap-1 px-3' : 'gap-2 px-5',
+            )}
+          >
+            <div
+              onClick={() => {
+                settingsStore.updateMenuCollapsed(!settingsStore.menuCollapsed);
+              }}
+              className="cursor-pointer xl:block hidden"
+            >
+              <Tooltip
+                title={
+                  settingsStore.menuCollapsed ? t('Show Menu') : t('Hide Menu')
+                }
+                mouseEnterDelay={1}
+              >
+                <Icon
+                  name={
+                    settingsStore.menuCollapsed
+                      ? 'side_menu_closed'
+                      : 'side_menu_open'
+                  }
+                  size={20}
+                />
+              </Tooltip>
+            </div>
+            <Logo siteId={siteId} small={isCollapsed} />
+          </div>
+          {isOnboarding ? (
+            <OnboardingMenu />
+          ) : (
+            <MenuContent
+              menu={menu}
+              isMenuItemActive={isMenuItemActive}
+              handleClick={handleClick}
+              isCollapsed={isCollapsed}
+            />
+          )}
+        </>
       )}
 
       {isMobile && (
@@ -169,18 +220,23 @@ function SideMenu(props: Props) {
               },
             }}
             height={520}
+            // below the FAB, which stays below every other drawer/modal (999+)
+            // so it never covers their footer buttons
+            zIndex={997}
             onClose={() => setMobileMenuOpen(false)}
             open={mobileMenuOpen}
             closeIcon={false}
           >
-            {
+            {isOnboarding ? (
+              <OnboardingMenu />
+            ) : (
               <MenuContent
                 menu={menu}
                 isMenuItemActive={isMenuItemActive}
                 handleClick={handleClick}
-                isCollapsed={isCollapsed}
+                isCollapsed={false}
               />
-            }
+            )}
           </Drawer>
 
           <Button
@@ -188,7 +244,7 @@ function SideMenu(props: Props) {
             shape="circle"
             size="large"
             icon={mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
-            style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 10000 }}
+            style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 998 }}
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
           />
         </>

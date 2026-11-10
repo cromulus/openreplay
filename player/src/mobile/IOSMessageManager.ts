@@ -1,7 +1,7 @@
 import logger from '../logger';
-import { TarFile } from 'js-untar';
+import { TarFile } from '../common/tarball';
 import { FrameSnapshot } from '../common/parseFrames';
-import { getResourceFromNetworkRequest } from '../';
+import { getResourceFromNetworkRequest } from '../web/types/resource';
 import ListWalker from '../common/ListWalker'
 import type { Store } from '../index';
 import { IMessageManager } from '../player/Animator';
@@ -144,7 +144,12 @@ export default class IOSMessageManager implements IMessageManager {
     this.snapshotManager = new SnapshotManager();
   }
 
-  public updateDimensions(dimensions: { width: number; height: number }) {
+  public updateDimensions(dimensions: {
+    width: number;
+    height: number;
+    sourceWidth?: number;
+    sourceHeight?: number;
+  }) {
     this.touchManager.updateDimensions(dimensions);
   }
 
@@ -321,6 +326,9 @@ export default class IOSMessageManager implements IMessageManager {
       case MType.MobileGraphQl:
         this.lists.lists.graphql.insert(msg);
         break;
+      case MType.MobileBatchMeta:
+          console.log('batch meta', msg);
+          break;
       default:
         console.log('unrecognized', msg);
         // stuff

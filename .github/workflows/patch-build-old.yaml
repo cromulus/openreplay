@@ -39,20 +39,21 @@ jobs:
 
     - name: Validate tag commits are in branch
       run: |
-        set -e
+        set -eo pipefail
         BRANCH_NAME=${{ github.event.inputs.branch }}
         TAG_NAME=${{ github.event.inputs.tag }}
         
         # Fetch the branch to ensure we have the latest
-        git fetch origin $BRANCH_NAME
+        # BRANCH_NAME may be a branch or a tag (e.g. v1.27.0); compare FETCH_HEAD
+        git fetch origin "$BRANCH_NAME"
         
         # Check if tag has commits not in the branch using git cherry
-        UNMERGED_COMMITS=$(git cherry origin/$BRANCH_NAME $TAG_NAME | grep '^+' | wc -l)
+        UNMERGED_COMMITS=$(git cherry FETCH_HEAD $TAG_NAME | { grep '^+' || true; } | wc -l)
         
         if [ $UNMERGED_COMMITS -gt 0 ]; then
           echo "Error: Tag '$TAG_NAME' has commits not present in branch '$BRANCH_NAME'"
           echo "Unmerged commits:"
-          git cherry origin/$BRANCH_NAME $TAG_NAME | grep '^+'
+          git cherry FETCH_HEAD $TAG_NAME | grep '^+'
           exit 1
         fi
         
@@ -134,7 +135,8 @@ jobs:
           [ -d $MSAAS_REPO_FOLDER ] || {
           git clone -b $INPUT_TAG --recursive https://x-access-token:$MSAAS_REPO_CLONE_TOKEN@$MSAAS_REPO_URL $MSAAS_REPO_FOLDER
           cd $MSAAS_REPO_FOLDER
-          cd openreplay && git fetch origin && git checkout $INPUT_TAG
+          # Build from the patch branch; INPUT_TAG still points to the old commit until the last step.
+          cd openreplay && git fetch origin $BRANCH_NAME && git checkout FETCH_HEAD
           git log -1
           cd $MSAAS_REPO_FOLDER
           bash git-init.sh
@@ -148,6 +150,7 @@ jobs:
           clone_msaas
           if grep -qx $service /tmp/backend.txt; then
             # Backend service: use dedicated build script
+            # Overrides only exist in msaas >= v1.25.0
             if [ -d "$MSAAS_REPO_FOLDER/backend" ]; then
               cp "$MSAAS_REPO_FOLDER"/backend/* \
                  "$MSAAS_REPO_FOLDER/openreplay/backend/"
@@ -172,24 +175,27 @@ jobs:
         fi
         echo Services: "${{ github.event.inputs.services }}"
         IFS=',' read -ra SERVICES <<< "${{ github.event.inputs.services }}" 
-        BUILD_SCRIPT_NAME="build.sh"
         # Build FOSS
         for SERVICE in "${SERVICES[@]}"; do
+          BUILD_SCRIPT_NAME="build.sh"
           is_ee_only=false
+          # crons is EE-only and versioned by the utilities chart
+          chart=$SERVICE
+          [[ $SERVICE == 'crons' ]] && chart=utilities && is_ee_only=true
           foss_build_args=""
           # Check if service is backend (FOSS)
-          if grep -q $SERVICE /tmp/backend.txt; then 
+          if grep -qx $SERVICE /tmp/backend.txt; then 
             cd backend 
             foss_build_args="nil $SERVICE"
             ee_build_args="ee $SERVICE"
           # Check if service is EE-only backend
-          elif grep -q $SERVICE /tmp/ee_backend.txt; then
+          elif grep -qx $SERVICE /tmp/ee_backend.txt; then
             cd backend
             foss_build_args="nil $SERVICE"
             ee_build_args="ee $SERVICE"
             # EE-only services (not in backend/cmd) - skip FOSS build
-            # These include: assist-api, video-replays, connector
-            if ! grep -q $SERVICE /tmp/backend.txt; then
+            # These include: video-replays, connector
+            if ! grep -qx $SERVICE /tmp/backend.txt; then
               is_ee_only=true
             fi
           else 
@@ -197,8 +203,8 @@ jobs:
             [[ $SERVICE == 'alerts' || $SERVICE == 'crons' ]] && BUILD_SCRIPT_NAME="build_${SERVICE}.sh"
             ee_build_args="ee"
           fi  
-          version=$(image_version $SERVICE)
-          # Build FOSS version (skip for EE-only services like assist-api)
+          version=$(image_version $chart)
+          # Build FOSS version (skip for EE-only services)
           if [[ "$is_ee_only" == "false" ]]; then
             echo IMAGE_TAG=$version DOCKER_RUNTIME="depot" DOCKER_BUILD_ARGS="--push" ARCH=amd64 DOCKER_REPO=$DOCKER_REPO_OSS PUSH_IMAGE=0 bash ${BUILD_SCRIPT_NAME} $foss_build_args
             IMAGE_TAG=$version DOCKER_RUNTIME="depot" DOCKER_BUILD_ARGS="--push" ARCH=amd64 DOCKER_REPO=$DOCKER_REPO_OSS PUSH_IMAGE=0 bash ${BUILD_SCRIPT_NAME} $foss_build_args
@@ -220,7 +226,7 @@ jobs:
             build_managed $SERVICE $version
           fi
           cd $working_dir
-          chart_path="$working_dir/scripts/helmcharts/openreplay/charts/$SERVICE/Chart.yaml"
+          chart_path="$working_dir/scripts/helmcharts/openreplay/charts/$chart/Chart.yaml"
           yq eval ".AppVersion = \"$version\"" -i $chart_path
           git add $chart_path
           git commit -m "Increment $SERVICE chart version"

@@ -1,5 +1,6 @@
 import { createMutationObserver, throttleWithTrailing } from '../../utils.js'
 import {
+  CreateDocument,
   RemoveNodeAttribute,
   SetNodeAttributeURLBased,
   SetCSSDataURLBased,
@@ -13,6 +14,7 @@ import {
   AdoptedSSInsertRuleURLBased,
   AdoptedSSAddOwner,
   SetNodeSlot,
+  ConsoleLog,
 } from '../messages.gen.js'
 import App from '../index.js'
 import {
@@ -27,6 +29,7 @@ import {
 import { inlineRemoteCss } from './cssInliner.js'
 import { nextID } from '../../modules/constructedStyleSheets.js'
 import { SanitizeLevel } from '../sanitizer.js'
+import { parentNode, previousSibling, nextSibling, firstChild } from '../untaintedDom.js'
 
 const iconCache = {}
 const svgUrlCache = {}
@@ -50,8 +53,15 @@ export async function parseUseEl(
       return
     }
 
-    if (iconCache[symbolId]) {
-      return iconCache[symbolId]
+    // Key the cache by url + symbol + mode: the same symbol id lives in different
+    // sprite files, and different modes store different value shapes (object vs
+    // string vs data-url), so keying by symbolId alone returns the wrong asset.
+    // Namespace remote vs in-document sprites so a relative sprite file literally
+    // named "local" can't collide with the in-document bucket.
+    const cacheKey = url ? `url:${url}#${symbolId}#${mode}` : `doc:${symbolId}#${mode}`
+
+    if (iconCache[cacheKey]) {
+      return iconCache[cacheKey]
     }
 
     // happens if svg spritemap is local, fastest case for us
@@ -72,7 +82,7 @@ export async function parseUseEl(
         </svg>
       `
 
-        iconCache[symbolId] = inlineSvg
+        iconCache[cacheKey] = inlineSvg
 
         return inlineSvg
       } else {
@@ -80,7 +90,7 @@ export async function parseUseEl(
         return
       }
     }
-    let svgDoc: Document
+    let svgDoc: Document | undefined
     if (svgUrlCache[url]) {
       if (svgUrlCache[url] === 1) {
         await new Promise((resolve) => {
@@ -104,10 +114,21 @@ export async function parseUseEl(
       }
     } else {
       svgUrlCache[url] = 1
-      const response = await fetch(url)
-      const svgText = await response.text()
-      svgDoc = domParser.parseFromString(svgText, 'image/svg+xml')
-      svgUrlCache[url] = svgDoc
+      try {
+        const response = await fetch(url)
+        const svgText = await response.text()
+        svgDoc = domParser.parseFromString(svgText, 'image/svg+xml')
+        svgUrlCache[url] = svgDoc
+      } catch (e) {
+        // Clear the in-flight sentinel so a failed fetch doesn't wedge every
+        // future <use> for this url into a 10s poll-then-give-up loop.
+        delete svgUrlCache[url]
+        throw e
+      }
+    }
+
+    if (!svgDoc) {
+      return
     }
 
     // @ts-ignore
@@ -120,7 +141,7 @@ export async function parseUseEl(
 
     if (mode === 'inline') {
       const res = { paths: symbol.innerHTML, vbox: symbol.getAttribute('viewBox') || '0 0 24 24' }
-      iconCache[symbolId] = res
+      iconCache[cacheKey] = res
       return res
     }
     if (mode === 'svgtext') {
@@ -130,7 +151,7 @@ export async function parseUseEl(
         </svg>
       `
 
-      iconCache[symbolId] = inlineSvg
+      iconCache[cacheKey] = inlineSvg
 
       return inlineSvg
     }
@@ -143,7 +164,7 @@ export async function parseUseEl(
       const encodedSvg = btoa(inlineSvg)
       const dataUrl = `data:image/svg+xml;base64,${encodedSvg}`
 
-      iconCache[symbolId] = dataUrl
+      iconCache[cacheKey] = dataUrl
 
       return dataUrl
     }
@@ -179,6 +200,12 @@ function isObservable(node: Node): boolean {
     return true
   }
   return !isIgnored(node)
+}
+
+const PRESERVE_VALUE_INPUT_TYPES = new Set(['button', 'reset', 'submit', 'checkbox', 'radio'])
+
+export function shouldSkipValueAttribute(node: Element): boolean {
+  return hasTag(node, 'input') && !PRESERVE_VALUE_INPUT_TYPES.has(node.type)
 }
 
 /*
@@ -237,7 +264,9 @@ export default abstract class Observer {
     this.inlinerOptions = options.inlinerOptions
     this.observer = createMutationObserver(
       this.app.safe((mutations) => {
+        let rootSwapped = false
         for (const mutation of mutations) {
+          try {
           // mutations order is sequential
           const target = mutation.target
           const type = mutation.type
@@ -246,6 +275,10 @@ export default abstract class Observer {
             continue
           }
           if (type === 'childList') {
+            if (this.isTopContext && isRootNode(target) && this.isRootSwapped()) {
+              rootSwapped = true
+              break
+            }
             for (let i = 0; i < mutation.removedNodes.length; i++) {
               // Should be the same as bindTree(mutation.removedNodes[i]), but logic needs to be be untied
               if (isObservable(mutation.removedNodes[i])) {
@@ -280,6 +313,13 @@ export default abstract class Observer {
             this.textSet.add(id)
             continue
           }
+          } catch (mutationErr) {
+            const t = mutation.target as Node & { tagName?: string }
+          }
+        }
+        if (rootSwapped) {
+          this.rebindRoot()
+          return
         }
         this.commitNodes()
       }) as MutationCallback,
@@ -292,6 +332,25 @@ export default abstract class Observer {
     this.indexes.length = 1
     this.attributesMap.clear()
     this.textSet.clear()
+  }
+
+  /** True when the node bound as 0 is no longer the live documentElement, i.e. the
+   *  page swapped <html> out (document.write(), documentElement.replaceWith(),
+   *  outerHTML = ...). Returns false mid-swap, while documentElement is null. */
+  private isRootSwapped(): boolean {
+    const bound = this.app.nodes.getNode(0)
+    const root = document.documentElement
+    return !!bound && !!root && bound !== root
+  }
+
+  private rebindRoot(): void {
+    this.clear()
+    this.app.sanitizer.clear()
+    this.app.nodes.clear()
+    this.app.send(CreateDocument())
+    this.app.nodes.callNodeCallbacks(document, true)
+    this.bindTree(document.documentElement)
+    this.commitNodes(true)
   }
 
   /**
@@ -344,6 +403,7 @@ export default abstract class Observer {
       }
       if (value === null) {
         this.app.send(RemoveNodeAttribute(id, name))
+        return
       }
 
       if (isUseElement(node) && name === 'href' && !this.disableSprites) {
@@ -369,6 +429,23 @@ export default abstract class Observer {
       }
       return
     }
+    // `open` alone can't tell showModal() (modal/top-layer) from show()/`<dialog open>`
+    // (non-modal); emit the mode alongside it so the player replays the right call (see DOMManager).
+    if (name === 'open' && hasTag(node, 'dialog')) {
+      let mode: 'modal' | 'nonmodal' | 'closed'
+      if (value === null) {
+        mode = 'closed'
+      } else {
+        let isModal = false
+        try {
+          isModal = (node as HTMLDialogElement).matches('dialog:modal')
+        } catch (e) {
+          /* :modal pseudo-class unsupported on this browser */
+        }
+        mode = isModal ? 'modal' : 'nonmodal'
+      }
+      this.app.send(SetNodeAttribute(id, '__openreplay_dialog', mode))
+    }
     if (
       name === 'src' ||
       name === 'srcset' ||
@@ -379,13 +456,7 @@ export default abstract class Observer {
     ) {
       return
     }
-    if (
-      name === 'value' &&
-      hasTag(node, 'input') &&
-      node.type !== 'button' &&
-      node.type !== 'reset' &&
-      node.type !== 'submit'
-    ) {
+    if (name === 'value' && shouldSkipValueAttribute(node)) {
       return
     }
     if (value === null) {
@@ -478,10 +549,11 @@ export default abstract class Observer {
       NodeFilter.SHOW_ELEMENT + NodeFilter.SHOW_TEXT,
       {
         acceptNode: (node) => {
-          if (this.app.nodes.getID(node) !== undefined) {
-            this.app.debug.info('! Node is already bound', node)
-          }
-          return isIgnored(node) || this.app.nodes.getID(node) !== undefined
+          // Use the Map-aware isBound() rather than the raw __openreplay_id
+          // property: a node carrying a stale id from a previous observe cycle
+          // must be re-accepted and re-bound here, otherwise the snapshot walk
+          // silently skips it (and its subtree, e.g. a <style>'s CSS text).
+          return isIgnored(node) || this.app.nodes.isBound(node)
             ? NodeFilter.FILTER_REJECT
             : NodeFilter.FILTER_ACCEPT
         },
@@ -539,7 +611,7 @@ export default abstract class Observer {
     }
     let slot = (node as any).assignedSlot as HTMLSlotElement | null
 
-    const parent = node.parentNode
+    const parent = parentNode(node)
     let parentID: number | undefined
 
     // Disable parent check for the upper context HTMLHtmlElement, because it is root there... (before)
@@ -547,8 +619,6 @@ export default abstract class Observer {
     // TODO: Clean the logic (though now it workd fine)
     if (!hasTag(node, 'html') || !this.isTopContext) {
       if (parent === null) {
-        // Sometimes one observation contains attribute mutations for the removimg node, which gets ignored here.
-        // That shouldn't affect the visual rendering ( should it? maybe when transition applied? )
         this.unbindTree(node)
         return false
       }
@@ -568,7 +638,7 @@ export default abstract class Observer {
       }
     }
     // From here parentID === undefined if node is top context HTML node
-    let sibling = node.previousSibling
+    let sibling = previousSibling(node)
     while (sibling !== null) {
       const siblingID = this.app.nodes.getID(sibling)
       if (siblingID !== undefined) {
@@ -576,7 +646,7 @@ export default abstract class Observer {
         this.indexes[id] = this.indexes[siblingID] + 1
         break
       }
-      sibling = sibling.previousSibling
+      sibling = previousSibling(sibling)
     }
     if (sibling === null) {
       this.indexes[id] = 0
@@ -713,7 +783,7 @@ export default abstract class Observer {
     if (!isObservable(root)) {
       return
     }
-    const parent = root.parentNode
+    const parent = parentNode(root)
     const parentId = parent !== null ? this.app.nodes.getID(parent) : undefined
     const parentLevel =
       parentId !== undefined ? this.app.sanitizer.getLevel(parentId) : SanitizeLevel.Plain
@@ -748,7 +818,7 @@ export default abstract class Observer {
       this.app.sanitizer.setLevel(id, newLevel)
       this.reemitNode(id, node)
     }
-    for (let child = node.firstChild; child !== null; child = child.nextSibling) {
+    for (let child = firstChild(node); child !== null; child = nextSibling(child)) {
       this.resanitizeNode(child, newLevel)
     }
   }
@@ -797,7 +867,7 @@ export default abstract class Observer {
 
   private reemitNode(id: number, node: Node): void {
     if (isTextNode(node)) {
-      const parent = node.parentNode
+      const parent = parentNode(node)
       if (parent !== null && isElementNode(parent)) {
         // re-runs sanitize() at the level we just set
         this.sendNodeData(id, parent, node.data)
@@ -811,9 +881,34 @@ export default abstract class Observer {
   }
 
   disconnect(): void {
+    // THEORY S3: a disconnect may discard MutationRecords still queued by the
+    // browser. takeRecords() drains them — they would be discarded by
+    // disconnect() below anyway, so this changes nothing functionally, it only
+    // lets us SEE whether a disconnect strands un-processed DOM additions
+    // (e.g. a freshly appended <head> <style>). NOTE: if this disconnect is part
+    // of stop(), the surrounding buffer may be cleared and this log lost; it is
+    // most reliable for mid-session re-observes (cold-start cycle / iframe).
+    const pending = this.observer.takeRecords()
+    if (pending.length) {
+      let addedEls = 0
+      const tags: string[] = []
+      for (const m of pending) {
+        for (let i = 0; i < m.addedNodes.length; i++) {
+          const n = m.addedNodes[i] as Node & { tagName?: string }
+          if (n.tagName) {
+            addedEls++
+            if (tags.length < 10) tags.push(n.tagName)
+          }
+        }
+      }
+    }
     this.observer.disconnect()
     this.clear()
     this.throttledSetNodeData.clear()
     this.generation++
+  }
+
+  protected resetThrottledSetNodeData(): void {
+    this.throttledSetNodeData.clear()
   }
 }
