@@ -4,8 +4,6 @@ x-openreplay-app-depends-on: &openreplay-app-depends-on
     condition: service_completed_successfully
   clickhouse-migration:
     condition: service_completed_successfully
-  kafka-migration:
-    condition: service_completed_successfully
 
 services:
 
@@ -63,77 +61,6 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
       RUSTFS_VOLUMES: /data
-
-  kafka:
-    image: ghcr.io/openreplay/kafka:${KAFKA_VERSION}
-    container_name: kafka
-    hostname: kafka
-    volumes:
-      - kafkadata:/bitnami/kafka
-    networks:
-      openreplay-net:
-        aliases:
-          - kafka.db.svc.cluster.local
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_CLUSTER_ID: "${COMMON_KAFKA_CLUSTER_ID}"
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka.db.svc.cluster.local:9092
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka.db.svc.cluster.local:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_LOG_DIRS: /bitnami/kafka/data
-      LOG_DIR: /bitnami/kafka/logs
-      KAFKA_MESSAGE_MAX_BYTES: "3145728"
-      KAFKA_REPLICA_FETCH_MAX_BYTES: "3145728"
-      KAFKA_LOG_RETENTION_HOURS: "168"
-      KAFKA_LOG_RETENTION_BYTES: "1073741824"
-      KAFKA_LOG_SEGMENT_BYTES: "1073741824"
-      KAFKA_CFG_LOG_FLUSH_INTERVAL_MESSAGES: "10000"
-      KAFKA_CFG_LOG_FLUSH_INTERVAL_MS: "1000"
-      KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS: "300000"
-      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-      KAFKA_CFG_NUM_IO_THREADS: "8"
-      KAFKA_CFG_NUM_NETWORK_THREADS: "3"
-      KAFKA_CFG_NUM_PARTITIONS: "1"
-      KAFKA_CFG_NUM_RECOVERY_THREADS_PER_DATA_DIR: "1"
-      KAFKA_CFG_SOCKET_RECEIVE_BUFFER_BYTES: "102400"
-      KAFKA_CFG_SOCKET_REQUEST_MAX_BYTES: "104857600"
-      KAFKA_CFG_SOCKET_SEND_BUFFER_BYTES: "102400"
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_CFG_DELETE_TOPIC_ENABLE: "false"
-      KAFKA_CFG_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
-      KAFKA_CFG_SUPER_USERS: "User:admin"
-    restart: unless-stopped
-
-  kafka-migration:
-    image: ghcr.io/openreplay/kafka:${KAFKA_VERSION}
-    container_name: kafka-migration
-    depends_on:
-      - kafka
-    networks:
-      - openreplay-net
-    volumes:
-      - ../helmcharts/openreplay/files/kafka.sh:/tmp/kafka.sh
-    environment:
-      KAFKA_HOST: kafka.db.svc.cluster.local
-      KAFKA_PORT: 9092
-      KAFKA_SSL: "false"
-      REPLICATION_FACTOR: 1
-    entrypoint:
-      - /bin/bash
-      - -c
-      - |
-          until /usr/lib/kafka/bin/kafka-topics.sh --bootstrap-server kafka.db.svc.cluster.local:9092 --list >/dev/null 2>&1; do
-              echo "Waiting for Kafka to be ready..."
-              sleep 2
-          done
-          PATH="/usr/lib/kafka/bin:$PATH" bash /tmp/kafka.sh init
 
   fs-permission:
     image: debian:stable-slim
@@ -549,24 +476,6 @@ services:
       - shared-volume:/mnt/efs
     env_file:
       - docker-envs/frontend.env
-    environment: {}  # Fallback empty environment if env_file is missing
-    depends_on: *openreplay-app-depends-on
-    restart: unless-stopped
-
-
-  heuristics-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/heuristics:${COMMON_VERSION:-v1.27.0}
-    domainname: app.svc.cluster.local
-    container_name: heuristics
-    networks:
-      openreplay-net:
-        aliases:
-          - heuristics-openreplay
-          - heuristics-openreplay.app.svc.cluster.local
-    volumes:
-      - shared-volume:/mnt/efs
-    env_file:
-      - docker-envs/heuristics.env
     environment: {}  # Fallback empty environment if env_file is missing
     depends_on: *openreplay-app-depends-on
     restart: unless-stopped
