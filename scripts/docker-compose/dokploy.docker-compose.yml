@@ -48,6 +48,9 @@ services:
   minio:
     image: rustfs/rustfs:${RUSTFS_VERSION}
     container_name: minio
+    depends_on:
+      fs-permission:
+        condition: service_completed_successfully
     volumes:
       - miniodata:/data
     networks:
@@ -73,7 +76,8 @@ services:
       - /bin/bash
       - -c
       - |
-        chown -R 1001:1001 /mnt/{efs,minio,postgres}
+        chown -R 1001:1001 /mnt/efs /mnt/postgres
+        chown -R 10001:10001 /mnt/minio
     restart: on-failure
 
   minio-migration:
@@ -82,8 +86,8 @@ services:
     pull_policy: build
     container_name: minio-migration
     depends_on:
-      - minio
-      - fs-permission
+      minio:
+        condition: service_started
     networks:
       - openreplay-net
     volumes:
@@ -108,8 +112,10 @@ services:
     image: ghcr.io/openreplay/postgres:${POSTGRES_VERSION}
     container_name: db-migration
     depends_on:
-      - postgresql
-      - minio-migration
+      postgresql:
+        condition: service_started
+      minio-migration:
+        condition: service_completed_successfully
     networks:
       - openreplay-net
     volumes:
@@ -140,8 +146,10 @@ services:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
     container_name: clickhouse-migration
     depends_on:
-      - clickhouse
-      - minio-migration
+      clickhouse:
+        condition: service_started
+      minio-migration:
+        condition: service_completed_successfully
     networks:
       - openreplay-net
     volumes:
