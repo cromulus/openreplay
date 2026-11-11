@@ -150,7 +150,9 @@ services:
     restart: on-failure
 
   minio-migration:
-    image: minio/mc:latest
+    build:
+      context: ./mc-client
+    pull_policy: build
     container_name: minio-migration
     depends_on:
       - minio
