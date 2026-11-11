@@ -243,24 +243,6 @@ services:
     restart: unless-stopped
 
 
-  integrations-openreplay:
-    image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/integrations:${COMMON_VERSION:-v1.27.0}
-    domainname: app.svc.cluster.local
-    container_name: integrations
-    networks:
-      openreplay-net:
-        aliases:
-          - integrations-openreplay
-          - integrations-openreplay.app.svc.cluster.local
-    volumes:
-      - shared-volume:/mnt/efs
-    env_file:
-      - docker-envs/integrations.env
-    environment: {}  # Fallback empty environment if env_file is missing
-    depends_on: *openreplay-app-depends-on
-    restart: unless-stopped
-
-
   sink-openreplay:
     image: ${COMMON_APP_IMAGE_REGISTRY:-public.ecr.aws/p1t3u8a3}/sink:${COMMON_VERSION:-v1.27.0}
     domainname: app.svc.cluster.local
